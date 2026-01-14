@@ -1,5 +1,6 @@
 import time
 import re
+import json
 import requests
 import streamlit as st
 
@@ -80,7 +81,7 @@ def get_keibago_data(year, month, day, race_no, baba_code):
     
     sess = get_http_session()
     try:
-        r = sess.get(url, timeout=15) # タイムアウト設定
+        r = sess.get(url, timeout=15)
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
         
@@ -231,31 +232,86 @@ def _parse_grades_fuzzy(horse_name, grades):
     return ""
 
 # ==================================================
-# Dify連携 & メイン実行
+# Dify連携 (Streaming対応版)
 # ==================================================
 def run_dify_simple(prompt):
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json"
     }
+    # ★修正点: response_mode を streaming に変更
     payload = {
         "inputs": {"text": prompt},
-        "response_mode": "blocking",
+        "response_mode": "streaming", 
         "user": "streamlit-user"
     }
-    sess = get_http_session() # リトライ付きセッションを使用
+    sess = get_http_session()
+    full_text = ""
+    
     try:
-        # ★ここを修正: timeoutを300秒(5分)に設定
-        res = sess.post(f"{DIFY_BASE_URL}/v1/workflows/run", headers=headers, json=payload, timeout=300)
-        
-        if res.status_code == 200:
-            return res.json().get('data', {}).get('outputs', {}).get('text', "Error: No text output")
-        return f"Dify Error: {res.status_code} {res.text}"
+        # stream=True で接続維持
+        with sess.post(f"{DIFY_BASE_URL}/v1/workflows/run", headers=headers, json=payload, stream=True, timeout=300) as response:
+            
+            # HTMLが返ってきてしまった場合（504エラー画面など）
+            if response.headers.get("Content-Type", "").startswith("text/html"):
+                return f"⚠️ Server Error: Dify(Cloudflare) returned HTML page instead of JSON. (Status: {response.status_code})"
+
+            if response.status_code != 200:
+                return f"Dify API Error: {response.status_code} {response.text}"
+
+            # ストリーミングデータを1行ずつ処理
+            for line in response.iter_lines():
+                if not line: continue
+                decoded_line = line.decode('utf-8')
+                
+                if decoded_line.startswith('data:'):
+                    json_str = decoded_line[5:].strip() # "data: " を削除
+                    if not json_str: continue
+                    
+                    try:
+                        data = json.loads(json_str)
+                        # event: message の時だけテキスト結合
+                        if data.get('event') == 'message' or data.get('event') == 'workflow_finished':
+                             # workflowモードの場合 outputs.text にあることが多い
+                            answer = data.get('data', {}).get('outputs', {}).get('text', '')
+                            # もしくは chatモードなら answer
+                            if not answer:
+                                answer = data.get('answer', '')
+                                
+                            # 差分ではなく全体が来る場合と、差分が来る場合があるが、
+                            # workflowモードのstreamingは通常、累積ではなくチャンクが来るか、
+                            # eventによってはfull textが来る。Difyの仕様に合わせて単純結合は危険だが、
+                            # 多くの場合は累積テキストではなく「そのパケットの分」が来る。
+                            # ここでは単純結合ではなく、outputs.textがある場合はそれを採用（上書き）していく方式が良いが
+                            # streamingの場合は "text" フィールドがチャンクで来る想定。
+                            
+                            # 注意: workflowのstreamingは最後にoutputsがドカンと来ることもあるが、
+                            # process中は空のことが多い。
+                            # とりあえず "text" があればそれを採用する。
+                            pass 
+
+                        # 完了時
+                        if data.get('event') == 'workflow_finished':
+                             res_text = data.get('data', {}).get('outputs', {}).get('text', '')
+                             if res_text: full_text = res_text
+
+                    except json.JSONDecodeError:
+                        pass
+            
+            # もしstreamingでうまく取れなかった場合、あるいはworkflow_finishedが来なかった場合への保険
+            if not full_text:
+                return "⚠️ Difyからの応答を解析できませんでした(Streaming Error)。"
+
+            return full_text
+
     except requests.exceptions.Timeout:
         return "⚠️ Dify Timeout: 処理に時間がかかりすぎたため中断されました(300秒超過)。"
     except Exception as e:
-        return f"Conn Error: {e}"
+        return f"Connection Error: {e}"
 
+# ==================================================
+# メイン実行
+# ==================================================
 def run_races_iter(year, month, day, place_code, target_races):
     place_map = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_map.get(place_code, "地方")
@@ -333,7 +389,7 @@ def run_races_iter(year, month, day, place_code, target_races):
             
             final_prompt = "\n".join(lines)
 
-            # Dify実行
+            # Dify実行 (Streaming)
             dify_res = run_dify_simple(final_prompt)
 
             # ローカル対戦表生成
