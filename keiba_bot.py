@@ -679,10 +679,10 @@ def run_races_iter(
                     "text": prompt,
                     "date": f"{year}/{month}/{day}",
                     "place": place_name,
-                    "race_no": str(race_num),  
-                    "year": int(year),
-                    "month": int(month),
-                    "day": int(day)
+                    "race_no": str(race_num), 
+                    "year": str(year),        
+                    "month": str(month),  
+                    "day": str(day)
                 }
                 
                 full_ans = run_dify_with_fallback(dify_inputs)
