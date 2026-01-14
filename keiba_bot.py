@@ -433,7 +433,7 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                     })
 
         # --- 出力生成 ---
-        output = ["###注目対戦"]
+        output = ["・注目対戦"]
         has_content = False
         
         for r in races:
@@ -450,7 +450,7 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
             # タイトル整形（日付などを見やすく）
             # 例: 2025.12.31 大井... -> **・ 2025.12.31 大井...**
             title_clean = re.sub(r'\s+', ' ', r['title']) # 余分な空白除去
-            output.append(f"**・ {title_clean}**")
+            output.append(f"○ {title_clean}**")
             output.append(" / ".join(line_items))
             output.append(f"[詳細]({r['url']})\n")
 
