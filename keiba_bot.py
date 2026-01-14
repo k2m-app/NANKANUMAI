@@ -46,7 +46,7 @@ def login_keibabook(driver, wait):
     time.sleep(1)
 
 # ==================================================
-# ★新機能: Streamlit側で対戦表を作る関数 (BeautifulSoup版)
+# ★Streamlit側で対戦表を作る関数 (BeautifulSoup版)
 # ==================================================
 def generate_battle_table_local(llm_text, year, month, day, place_name, race_num):
     """
@@ -59,6 +59,10 @@ def generate_battle_table_local(llm_text, year, month, day, place_name, race_num
     header_info = ""
     if error_msg:
         header_info = f"⚠️ 開催情報取得エラー: {error_msg}\n"
+        # エラー時はデフォルト値（URL生成用）を設定して続行を試みるか、ここで止めるか
+        # ここではとりあえずURL生成を試みる
+        if not kai: kai = 15
+        if not nichi: nichi = 1
     else:
         header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} 第{kai}回 {nichi}日目\n"
 
@@ -72,6 +76,18 @@ def generate_battle_table_local(llm_text, year, month, day, place_name, race_num
     return f"{header_info}\n{llm_text}\n\n{history_text}"
 
 # --- 以下、対戦表作成のための裏方機能 ---
+
+def _clean_text_strict(text):
+    """改行や空白を完全に除去して1行にする"""
+    if not text: return ""
+    # HTMLタグ除去
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # 実体参照変換
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&')
+    # 改行・タブをスペースに変換
+    text = re.sub(r'[\r\n\t]+', ' ', text)
+    # 連続するスペースを1つに
+    return re.sub(r'\s+', ' ', text).strip()
 
 def _get_kai_nichi(target_month, target_day, target_place):
     """
@@ -92,20 +108,30 @@ def _get_kai_nichi(target_month, target_day, target_place):
                 break
         
         if not target_row:
-            return 15, 4, f"{target_place}の開催情報が見つかりませんでした(仮値で続行)"
+            return None, None, f"{target_place}の開催情報が見つかりませんでした"
 
         # リンクや画像altの中から開催情報を探す
         info_text = ""
         link = target_row.find('a')
         if link:
-            info_text = link.get_text(strip=True)
-        
+            # タグを含めた生テキストから改行を除去して取得
+            info_text = _clean_text_strict(link.get_text())
+        else:
+            # リンクがない場合（開催期間外など）
+            info_text = _clean_text_strict(target_row.get_text())
+
         # 正規表現で「第15回 1月 12, 13...」を解析
+        # \s* で改行やスペースを許容
         match = re.search(r'第(\d+)回.*?(\d+)月\s*(.*?)日', info_text)
         if not match:
-            return 15, 4, f"開催テキスト解析失敗: {info_text}"
+            return None, None, f"開催テキスト解析失敗: {info_text}"
 
         kai_val = int(match.group(1))
+        # 月の確認
+        mon_val = int(match.group(2))
+        if int(target_month) != mon_val:
+             return None, None, f"開催月不一致(Web:{mon_val}月, 指定:{target_month}月)"
+
         # 日付リスト作成 "12, 13, 14" -> [12, 13, 14]
         days_str = match.group(3)
         days_clean = re.sub(r'[^\d,]', '', days_str.replace('，', ','))
@@ -116,10 +142,10 @@ def _get_kai_nichi(target_month, target_day, target_place):
             nichi_val = days_list.index(target_day_int) + 1
             return kai_val, nichi_val, None
         else:
-            return 15, 4, f"指定日({target_day})が期間外です"
+            return None, None, f"指定日({target_day})が期間外です(開催予定:{days_list})"
 
     except Exception as e:
-        return 15, 4, str(e)
+        return None, None, str(e)
 
 def _parse_grades(text):
     """
@@ -131,7 +157,7 @@ def _parse_grades(text):
     for line in text.split('\n'):
         if '|' in line and '---' not in line:
             parts = [p.strip() for p in line.split('|')]
-            # テーブルの列数に合わせて調整（馬名が2列目、評価が最後から2列目と仮定）
+            # テーブルの列数に合わせて調整
             if len(parts) >= 4:
                 raw_name = parts[1]
                 raw_grade = parts[-2] # 最後が空文字になることがあるので -2 を推奨
@@ -190,7 +216,7 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
                 
                 # 不要な文字を削除して整形
                 info_text = raw_info.replace('競走成績', '').replace('対戦表', '')
-                info_text = re.sub(r'\s+', ' ', info_text).strip()
+                info_text = _clean_text_strict(info_text)
                 
                 full_url = "https://www.nankankeiba.com" + link['href']
                 
@@ -304,20 +330,21 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
         return f"\n(対戦表生成エラー: {str(e)})"
 
 # ==================================================
-# Dify連携 (シンプル版)
+# Dify連携 (入力パラメータ対応版)
 # ==================================================
-def run_dify(inputs):
+def run_dify(inputs_dict):
     """
-    Difyにテキストを送って、予想コメントだけを返してもらう
+    Difyに辞書データを送って、予想コメントを返してもらう
+    inputs_dict: {"text": "...", "date": "...", ...}
     """
     url = f"{DIFY_BASE_URL}/v1/workflows/run"
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json"
     }
-    # Dify側は 'text' 変数を受け取る設定になっている想定
+    
     payload = {
-        "inputs": inputs,
+        "inputs": inputs_dict, # 辞書をそのまま渡す
         "response_mode": "blocking",
         "user": "streamlit-user"
     }
@@ -345,9 +372,6 @@ def run_dify(inputs):
 # メイン処理 (イテレータ)
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, ui=False):
-    # (注意) ここではScraping部分は省略せず、ユーザーの環境に合わせて
-    #       fetch_race_ids_from_schedule などを呼び出す必要があります。
-    #       以下の実装は「Dify連携と対戦表結合」の流れを示すものです。
     
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
@@ -358,34 +382,88 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
     
     try:
         # 1. 競馬ブックログイン
-        # _ui_info(ui, "🔑 ログイン中...") 
         login_keibabook(driver, wait)
         
-        # 2. レースID取得 (既存の関数を使用する想定)
-        # race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
-        # ここではデモ用にダミーIDリストを使いますが、実際は上の行を有効化してください
-        # ---------------------------------------------------------------
-        # ★★★ ここに元のスクレイピングロジック(fetch_race_ids...)を入れてください ★★★
-        # ---------------------------------------------------------------
+        # 2. レースID取得
+        # ここでは本来のスクレイピング関数(fetch_race_ids_from_schedule)を呼び出す
+        # ※実際のコードに合わせてこの行のコメントアウトを外してください
+        from keiba_bot import fetch_race_ids_from_schedule, fetch_keibago_debatable_small, parse_race_info, parse_danwa_comments, parse_cyokyo
+        race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
         
-        # 仮: ユーザーが指定したレース番号だけ回すループ
-        for race_num in sorted(list(target_races)):
+        if not race_ids:
+            yield 0, "⚠️ レースIDが取得できませんでした"
+            return
+
+        baba_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
+        baba_code = baba_map.get(place_code, "20")
+
+        for i, race_id in enumerate(race_ids):
+            race_num = i + 1
+            if target_races is not None and race_num not in target_races:
+                continue
             
-            # 3. 馬データのスクレイピング (省略・既存コード利用)
-            # prompt = "..." 
-            prompt = f"（{place_name}{race_num}R の馬データがここに入ります）" # ダミー
+            # --- 3. 馬データのスクレイピング (統合) ---
+            # keiba.go.jp
+            header, keibago_dict, keibago_url, nar_race_level = fetch_keibago_debatable_small(
+                year=str(year), month=str(month), day=str(day),
+                race_no=race_num, baba_code=str(baba_code)
+            )
             
-            # 4. Dify実行 (予想テキスト生成)
-            dify_res = run_dify({"text": prompt})
+            # 談話
+            driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
+            html_danwa = driver.page_source
+            race_meta = parse_race_info(html_danwa)
+            danwa_dict = parse_danwa_comments(html_danwa)
             
-            # 5. ★Streamlit側で対戦表を作成＆結合 (BeautifulSoup版)
+            # 調教
+            driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
+            cyokyo_dict = parse_cyokyo(driver.page_source)
+            
+            # データ結合
+            all_uma = sorted(
+                set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(keibago_dict.keys()),
+                key=lambda x: int(x) if str(x).isdigit() else 999,
+            )
+            
+            merged_text = []
+            for uma in all_uma:
+                kg = keibago_dict.get(uma, {})
+                d = danwa_dict.get(uma, "（なし）")
+                c = cyokyo_dict.get(uma, "（なし）")
+                
+                info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{kg.get('jockey','')} 調教師:{kg.get('trainer','')}"
+                if kg.get('is_change'): info += " 【⚠️乗り替わり】"
+                
+                merged_text.append(f"{info}\n談話: {d}\n調教: {c}")
+                
+            prompt = (
+                f"レース名: {race_meta.get('race_name','')}\n"
+                f"条件: {race_meta.get('cond','')}\n\n"
+                + "\n".join(merged_text)
+            )
+            
+            # --- 4. Dify実行 (予想テキスト生成) ---
+            # ★修正: 全ての変数を辞書で渡す
+            dify_inputs = {
+                "text": prompt,
+                "date": f"{year}/{month}/{day}",
+                "place": place_name,
+                "race_no": str(race_num),
+                "year": str(year),
+                "month": str(month),
+                "day": str(day)
+            }
+            
+            dify_res = run_dify(dify_inputs)
+            
+            # --- 5. Streamlit側で対戦表を作成＆結合 ---
             final_output = generate_battle_table_local(
                 dify_res, year, month, day, place_name, race_num
             )
             
             yield race_num, final_output
             
-            time.sleep(1)
+            time.sleep(2) # 負荷軽減
 
     finally:
         driver.quit()
