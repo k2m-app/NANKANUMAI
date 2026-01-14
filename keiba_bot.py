@@ -254,25 +254,19 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     return header, horses, url, nar_race_level
 
 # ==================================================
-# ★開催情報（回・日次）判定ロジック（修正版）
+# ★開催情報（回・日次）判定ロジック
 # ==================================================
 def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
-    """
-    南関公式サイトから「第X回 Y日目」を特定する。
-    特殊文字（&nbsp;など）を含んでも柔軟に解析できるように修正。
-    """
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
     sess = get_http_session()
     try:
         res = sess.get(url, timeout=10)
-        res.encoding = 'cp932' # Shift_JIS
+        res.encoding = 'cp932'
         soup = BeautifulSoup(res.text, 'html.parser')
         
         target_row = None
-        # テーブル行を走査し、競馬場名が一致する行を探す
         for tr in soup.find_all('tr'):
             tds = tr.find_all('td')
-            # 2番目のtdに競馬場名が入っている構造
             if len(tds) >= 3 and target_place_name in tds[1].get_text():
                 target_row = tr
                 break
@@ -280,37 +274,26 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
         if not target_row:
             return 0, 0, f"開催情報なし: {target_place_name}"
 
-        # 3番目のtd（開催情報セル）を取得
         info_td = target_row.find_all('td')[2]
-        
-        # ★修正ポイント：テキスト取得後に正規化（nbspなどを半角スペースへ）
-        # .get_text(" ", strip=True) だけだと &nbsp; がうまく処理されない場合があるため
         info_text = info_td.get_text(" ", strip=True)
-        info_text = info_text.replace('\u00a0', ' ').replace('\u3000', ' ') # nbsp, 全角スペース除去
+        info_text = info_text.replace('\u00a0', ' ').replace('\u3000', ' ')
 
-        # ★修正ポイント：正規表現を緩くする
-        # "第" [スペースや文字] "数字" [スペース] "回" ... "数字" [スペース] "月"
-        # 例: 第 15 回 1月 12, 13...
+        # 正規表現: "第 15 回 ... 1 月 12, 13..."
         m = re.search(r'第\s*(\d+)\s*回[^\d]*(\d+)\s*月\s*(.*?)\s*日', info_text)
-        
         if not m:
-             # 開催がない場合はここに来る可能性がある
              return 0, 0, f"開催情報パース不可: {info_text}"
 
         kai = int(m.group(1))
         mon = int(m.group(2))
-        days_str = m.group(3) # "12, 13, 14, 15, 16"
+        days_str = m.group(3)
 
-        # 月チェック
         if mon != int(target_month):
              return 0, 0, f"開催月不一致 (Web:{mon}月, 指定:{target_month}月)"
 
-        # 日付リスト化
         days = [int(d) for d in re.findall(r'\d+', days_str)]
         target_d = int(target_day)
         
         if target_d in days:
-            # 配列のインデックス+1 が「日目」になる
             nichi = days.index(target_d) + 1
             return kai, nichi, None
         else:
@@ -341,7 +324,6 @@ def _parse_grades_fuzzy(horse_name, grades):
     return ""
 
 def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nichi):
-    # 回・日次が特定できていない場合はエラーメッセージを返す
     if kai == 0 or nichi == 0:
         return "\n(開催回・日次の自動判定に失敗したため、対戦表を取得できませんでした)"
 
@@ -355,44 +337,102 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
         res.encoding = 'cp932'
         soup = BeautifulSoup(res.text, 'html.parser')
         
+        # ★修正：ご提示いただいた構造に合わせてテーブルを特定
+        # 1. まずクラス名で探す
         tbl = soup.find('table', class_='nk23_c-table08__table')
-        if not tbl: return f"\n(対戦データなし: {url})"
+        
+        # 2. なければ、特徴的なヘッダーを持つテーブルを探す
+        if not tbl:
+            for t in soup.find_all('table'):
+                if "競走成績" in t.get_text(): # 「競走成績」ボタンが含まれるテーブル
+                    tbl = t
+                    break
+        
+        if not tbl:
+             return f"\n(対戦データなし or テーブル特定失敗: {url})"
 
-        tbody = tbl.find('tbody')
+        # theadとtbodyの取得
         thead = tbl.find('thead')
-        if not (thead and tbody): return ""
+        tbody = tbl.find('tbody')
+        if not (thead and tbody): return f"\n(テーブル構造エラー: {url})"
 
+        # --- ヘッダー解析（過去レース情報） ---
         races = []
-        for th in thead.find_all('th')[1:]:
-            link = th.find('a')
-            if link:
-                title = th.get_text(strip=True).replace('競走成績', '').replace('対戦表', '')
-                r_url = "https://www.nankankeiba.com" + link.get('href', '')
-                races.append({"title": title, "url": r_url, "results": []})
+        # ヘッダー行のセル（th/td）を取得。最初の2つ（枠番、馬番）はスキップ
+        # ※ row-spanなどがあるため、trの構造に依存します
+        header_row = thead.find('tr')
+        if header_row:
+            cols = header_row.find_all(['th', 'td'])
+            # 3列目以降がレース情報と仮定
+            for col in cols[2:]:
+                # 日付やレース名が含まれる div.nk23_c-table08__detail を探す
+                detail_div = col.find(class_='nk23_c-table08__detail')
+                if detail_div:
+                    # 改行をスペースに置換して整形
+                    info_text = detail_div.get_text(" ", strip=True)
+                    # "2025.12.31 大井 稍重 16 1200 1133 12 おおとり賞..." のようなテキストになる
+                    
+                    # リンク先のURLも取得
+                    link = col.find('a', href=re.compile(r'/result/\d+'))
+                    r_url = ""
+                    if link:
+                        r_url = "https://www.nankankeiba.com" + link.get('href', '')
+                    
+                    races.append({"title": info_text, "url": r_url, "results": []})
 
         if not races: return "\n(初対戦)"
 
+        # --- データ行解析（各馬の着順） ---
         for tr in tbody.find_all('tr'):
-            cells = tr.find_all(['td', 'th'])
-            if not cells: continue
+            # 馬名セルを探す（aタグのclassが nk23_c-table08__text）
+            uma_link = tr.find('a', class_='nk23_c-table08__text')
+            if not uma_link: continue
             
-            uma_tag = cells[0].find('a')
-            if not uma_tag: continue
-            h_name = uma_tag.get_text(strip=True)
-            h_grade = _parse_grades_fuzzy(h_name, grades)
+            horse_name = uma_link.get_text(strip=True)
+            h_grade = _parse_grades_fuzzy(horse_name, grades)
 
-            for i, cell in enumerate(cells[1:]):
+            # この行のセルを取得（最初の1つは馬番列なのでスキップ）
+            # ※ rowspanがある「枠番」列はtbodyには含まれないことが多いが、サイト構造による
+            cells = tr.find_all(['td', 'th'])
+            
+            # 馬名セルの次からが結果セル
+            # 馬名セルが何番目か特定
+            name_cell_idx = -1
+            for idx, c in enumerate(cells):
+                if c.find('a', class_='nk23_c-table08__text'):
+                    name_cell_idx = idx
+                    break
+            
+            if name_cell_idx == -1: continue
+
+            result_cells = cells[name_cell_idx+1:]
+
+            for i, cell in enumerate(result_cells):
                 if i >= len(races): break
-                rank_text = cell.get_text(strip=True).split('｜')[0].strip()
-                if rank_text and (rank_text.isdigit() or rank_text in ['除外','取消']):
+                
+                # 着順を取得（nk23_c-table08__number 内の span または テキスト）
+                rank_text = ""
+                num_p = cell.find('p', class_='nk23_c-table08__number')
+                if num_p:
+                    # <span>1</span>｜57.0... のような構造
+                    span = num_p.find('span')
+                    if span:
+                        rank_text = span.get_text(strip=True)
+                    else:
+                        # spanがない場合（除外など）
+                        txt = num_p.get_text(strip=True).split('｜')[0]
+                        rank_text = txt.strip()
+                
+                if rank_text and (rank_text.isdigit() or rank_text in ['除外','中止','取消']):
                     sort_k = int(rank_text) if rank_text.isdigit() else 999
                     races[i]["results"].append({
                         "rank": rank_text,
-                        "name": h_name,
+                        "name": horse_name,
                         "grade": h_grade,
                         "sort": sort_k
                     })
 
+        # --- 出力生成 ---
         output = ["###注目対戦"]
         has_content = False
         
@@ -407,7 +447,10 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                 rank_disp = f"{res['rank']}着" if res['rank'].isdigit() else res['rank']
                 line_items.append(f"{rank_disp} {res['name']}{g_str}")
             
-            output.append(f"**・ {r['title']}**")
+            # タイトル整形（日付などを見やすく）
+            # 例: 2025.12.31 大井... -> **・ 2025.12.31 大井...**
+            title_clean = re.sub(r'\s+', ' ', r['title']) # 余分な空白除去
+            output.append(f"**・ {title_clean}**")
             output.append(" / ".join(line_items))
             output.append(f"[詳細]({r['url']})\n")
 
@@ -492,13 +535,11 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
         _ui_info(ui, "🔑 ログイン中...")
         login_keibabook(driver, wait)
         
-        # 1. 競馬ブックからレースIDを取得
         race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
         if not race_ids:
             yield (0, "⚠️ レースID取得失敗")
             return
 
-        # 2. ★南関公式サイトから「第X回Y日目」を取得
         _ui_info(ui, f"📅 開催情報（回・日次）を解析中... ({place_name} {month}/{day})")
         kai_val, nichi_val, date_err = _get_kai_nichi_from_web(month, day, place_name)
         
@@ -514,7 +555,6 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
             _ui_markdown(ui, f"## {place_name} {race_num}R")
             
             try:
-                # 3. データ取得
                 header, keibago_dict, _, nar_race_level = fetch_keibago_debatable_small(
                     str(year), str(month), str(day), race_num, str(baba_code)
                 )
@@ -529,7 +569,6 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 danwa_dict = parse_danwa_comments(html_danwa)
                 cyokyo_dict = parse_cyokyo(html_cyokyo)
 
-                # 4. プロンプト作成
                 all_uma = sorted(set(danwa_dict) | set(cyokyo_dict) | set(keibago_dict), key=lambda x: int(x) if x.isdigit() else 999)
                 merged_text = []
                 
@@ -554,16 +593,13 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                     + "\n".join(merged_text)
                 )
 
-                # 5. AI実行
                 _ui_info(ui, "🤖 AI分析中...")
                 dify_res = run_dify_with_fallback(prompt)
                 dify_res = (dify_res or "").strip()
 
-                # 6. 対戦表生成 (★取得した kai, nichi を使う)
                 grades = _parse_grades(dify_res)
                 history_text = _fetch_history_data(year, month, day, place_name, race_num, grades, kai_val, nichi_val)
 
-                # 7. 結合出力
                 header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} 第{kai_val}回 {nichi_val}日目 {race_num}R"
                 final_output = f"{header_info}\n\n{dify_res}\n\n{history_text}"
                 
