@@ -242,11 +242,11 @@ def generate_battle_table_local(llm_text, year, month, day, place_name, race_num
     
     header_info = ""
     if error_msg:
-        header_info = f"⚠️ 開催情報エラー: {error_msg}\n"
+        header_info = f"開催情報エラー: {error_msg}\n"
         if not kai: kai = 15 # 仮
         if not nichi: nichi = 1
     else:
-        header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} 第{kai}回 {nichi}日目\n"
+        header_info = f"自動判定: {year}年{month}月{day}日 {place_name} 第{kai}回 {nichi}日目\n"
 
     # 2. LLMテキストから評価(S,A...)を読み取る
     grade_map = _parse_grades(llm_text)
@@ -420,7 +420,7 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
         # 日付順（新しい順）＝ IDの降順
         past_races.sort(key=lambda x: x['id'], reverse=True)
         
-        output = ["### 📊 注目対戦"] # タイトル変更
+        output = ["###注目対戦"] # タイトル変更
         has_data = False
         
         for race in past_races:
