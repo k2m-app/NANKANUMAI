@@ -452,7 +452,7 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                         "sort": sort_k
                     })
 
-        output = ["・注目対戦"]
+        output = ["注目の対戦"]
         has_content = False
         
         for r in races:
@@ -467,7 +467,7 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                 line_items.append(f"{rank_disp} {res['name']}{g_str}")
             
             title_clean = re.sub(r'\s+', ' ', r['title']) 
-            output.append(f"○ {title_clean}**")
+            output.append(f"{title_clean}")
             output.append(" / ".join(line_items))
             output.append(f"[詳細]({r['url']})\n")
 
