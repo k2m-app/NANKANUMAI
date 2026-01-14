@@ -240,7 +240,6 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         trainer = trainer_raw.split("（")[0].strip() if trainer_raw else "不明"
         jockey = _extract_jockey_from_cell(jockey_td)
         
-        # ★前走騎手取得
         prev_jockey = ""
         if zenso_td:
             m = _PREV_JOCKEY_RE.search(zenso_td.get_text(" ", strip=True))
@@ -255,29 +254,64 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     return header, horses, url, nar_race_level
 
 # ==================================================
-# ★対戦表生成ロジック
+# ★開催情報（回・日次）判定ロジック（南関公式サイト解析）
 # ==================================================
-def _get_kai_nichi(target_month, target_day, target_place):
+def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
+    """
+    https://www.nankankeiba.com/bangumi_menu/bangumi.do をスクレイピングして、
+    指定された競馬場の「第X回 Y日目」を正確に特定する。
+    """
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
     sess = get_http_session()
     try:
         res = sess.get(url, timeout=10)
-        res.encoding = 'cp932'
+        res.encoding = 'cp932' # 南関はShift_JIS/cp932
         soup = BeautifulSoup(res.text, 'html.parser')
         
+        target_row = None
+        # テーブル行を走査し、競馬場名が一致する行を探す
         for tr in soup.find_all('tr'):
-            text = tr.get_text()
-            if target_place in text and "競馬" in text:
-                m = re.search(r'第(\d+)回.*?(\d+)月\s*(.*?)日', text)
-                if m:
-                    mon = int(m.group(2))
-                    if mon != int(target_month): continue
-                    days = [int(d) for d in re.findall(r'\d+', m.group(3))]
-                    if int(target_day) in days:
-                        return int(m.group(1)), days.index(int(target_day)) + 1, None
-        return None, None, "開催情報特定不可"
+            tds = tr.find_all('td')
+            # 2番目のtdに競馬場名が入っている構造
+            if len(tds) >= 3 and target_place_name in tds[1].get_text():
+                target_row = tr
+                break
+        
+        if not target_row:
+            return 0, 0, f"開催情報なし: {target_place_name}"
+
+        # 3番目のtd（開催情報セル）を取得
+        info_td = target_row.find_all('td')[2]
+        info_text = info_td.get_text(" ", strip=True) # 例: "第15回 1月 12, 13, 14, 15, 16日"
+
+        # 正規表現で解析
+        # 例: 第15回 1月 12, 13, 14, 15, 16日
+        m = re.search(r'第(\d+)回.*?(\d+)月\s*(.*?)日', info_text)
+        if not m:
+             # リンクがない（開催予定なし）場合など
+             return 0, 0, f"開催情報パース不可: {info_text}"
+
+        kai = int(m.group(1))
+        mon = int(m.group(2))
+        days_str = m.group(3) # "12, 13, 14, 15, 16"
+
+        # 月チェック
+        if mon != int(target_month):
+             return 0, 0, f"開催月不一致 (Web:{mon}月, 指定:{target_month}月)"
+
+        # 日付リスト化
+        days = [int(d) for d in re.findall(r'\d+', days_str)]
+        target_d = int(target_day)
+        
+        if target_d in days:
+            # 配列のインデックス+1 が「日目」になる
+            nichi = days.index(target_d) + 1
+            return kai, nichi, None
+        else:
+            return 0, 0, f"指定日({target_d}日)が開催期間{days}に含まれていません"
+
     except Exception as e:
-        return None, None, str(e)
+        return 0, 0, f"GetKaiNichi Error: {e}"
 
 def _parse_grades(text):
     grades = {}
@@ -300,9 +334,10 @@ def _parse_grades_fuzzy(horse_name, grades):
             return v
     return ""
 
-def _fetch_history_data(year, month, day, place_name, race_num, grades):
-    kai, nichi, err = _get_kai_nichi(month, day, place_name)
-    if err: kai, nichi = 15, 1
+def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nichi):
+    # 回・日次が特定できていない場合はエラーメッセージを返す
+    if kai == 0 or nichi == 0:
+        return "\n(開催回・日次の自動判定に失敗したため、対戦表を取得できませんでした)"
 
     p_code = {'浦和': '18', '船橋': '19', '大井': '20', '川崎': '21'}.get(place_name, '20')
     race_id = f"{year}{int(month):02}{int(day):02}{p_code}{int(kai):02}{int(nichi):02}{int(race_num):02}"
@@ -401,13 +436,11 @@ def run_dify_workflow_blocking(full_text: str) -> str:
     sess = get_http_session()
 
     try:
-        # ★タイムアウトを300秒(5分)に設定して粘る
         res = sess.post(url, headers=headers, json=payload, timeout=(10, 300))
         if res.status_code != 200: return _format_http_error(res)
         
         j = res.json() or {}
         outputs = j.get("data", {}).get("outputs", {})
-        # textフィールドを優先取得
         return outputs.get("text") or str(outputs)
     except Exception as e:
         return f"⚠️ blocking API Error: {str(e)}"
@@ -418,7 +451,6 @@ def run_dify_with_fallback(full_text: str) -> str:
         res = run_dify_workflow_blocking(full_text)
         
         is_error = False
-        # エラーワードが含まれていたらリトライ対象とする
         if "⚠️" in res and ("503" in res or "overloaded" in res or "PluginInvokeError" in res):
             is_error = True
         
@@ -454,10 +486,20 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
         _ui_info(ui, "🔑 ログイン中...")
         login_keibabook(driver, wait)
         
+        # 1. 競馬ブックからレースIDを取得
         race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
         if not race_ids:
             yield (0, "⚠️ レースID取得失敗")
             return
+
+        # 2. ★修正: ここで南関競馬サイトから「第X回Y日目」を一度だけ取得する
+        _ui_info(ui, f"📅 開催情報（回・日次）を解析中... ({place_name} {month}/{day})")
+        kai_val, nichi_val, date_err = _get_kai_nichi_from_web(month, day, place_name)
+        
+        if date_err:
+            _ui_warning(ui, f"⚠️ {date_err}（対戦表URLが正しく生成されない可能性があります）")
+        else:
+            _ui_success(ui, f"✅ 開催判定成功: 第{kai_val}回 {nichi_val}日目")
 
         for i, race_id in enumerate(race_ids):
             race_num = i + 1
@@ -466,7 +508,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
             _ui_markdown(ui, f"## {place_name} {race_num}R")
             
             try:
-                # 1. データ取得
+                # 3. データ取得
                 header, keibago_dict, _, nar_race_level = fetch_keibago_debatable_small(
                     str(year), str(month), str(day), race_num, str(baba_code)
                 )
@@ -477,25 +519,22 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
                 html_cyokyo = driver.page_source
                 
-                race_meta = parse_race_info(html_danwa)
+                meta_info = parse_race_info(html_danwa)
                 danwa_dict = parse_danwa_comments(html_danwa)
                 cyokyo_dict = parse_cyokyo(html_cyokyo)
 
-                # 2. プロンプト作成
+                # 4. プロンプト作成
                 all_uma = sorted(set(danwa_dict) | set(cyokyo_dict) | set(keibago_dict), key=lambda x: int(x) if x.isdigit() else 999)
                 merged_text = []
                 
                 for uma in all_uma:
                     kg = keibago_dict.get(uma, {})
-                    
-                    # ★修正点: 前走騎手をプロンプトに含める
                     prev_info = ""
                     if kg.get('is_change'):
                         pj = kg.get('prev_jockey', '')
                         prev_info = f" 【⚠️乗り替わり】(前走:{pj})" if pj else " 【⚠️乗り替わり】"
 
                     info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{kg.get('jockey','')}{prev_info} 調教師:{kg.get('trainer','')}"
-                    
                     merged_text.append(f"{info}\n談話: {danwa_dict.get(uma,'なし')}\n調教: {cyokyo_dict.get(uma,'なし')}")
 
                 if not merged_text:
@@ -503,29 +542,28 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                     continue
 
                 prompt = (
-                    f"レース名: {race_meta.get('race_name','')}\n"
+                    f"レース名: {meta_info.get('race_name','')}\n"
                     f"レースレベル: {nar_race_level}\n"
-                    f"条件: {race_meta.get('cond','')}\n\n"
+                    f"条件: {meta_info.get('cond','')}\n\n"
                     + "\n".join(merged_text)
                 )
 
-                # 3. AI実行
+                # 5. AI実行
                 _ui_info(ui, "🤖 AI分析中...")
-                # UIなしのイテレータでもリトライ機能付き関数を呼ぶ
                 dify_res = run_dify_with_fallback(prompt)
                 dify_res = (dify_res or "").strip()
 
-                # 4. 対戦表生成
+                # 6. 対戦表生成 (★取得した kai, nichi を使う)
                 grades = _parse_grades(dify_res)
-                history_text = _fetch_history_data(year, month, day, place_name, race_num, grades)
+                history_text = _fetch_history_data(year, month, day, place_name, race_num, grades, kai_val, nichi_val)
 
-                # 5. 結合出力
-                header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} {race_num}R"
+                # 7. 結合出力
+                header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} 第{kai_val}回 {nichi_val}日目 {race_num}R"
                 final_output = f"{header_info}\n\n{dify_res}\n\n{history_text}"
                 
                 _ui_success(ui, "✅ 完了")
                 yield (race_num, final_output)
-                time.sleep(3) # 連続アクセス防止の待機
+                time.sleep(3)
 
             except Exception as e:
                 yield (race_num, f"⚠️ Error: {e}")
