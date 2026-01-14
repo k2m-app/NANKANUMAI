@@ -240,6 +240,7 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         trainer = trainer_raw.split("（")[0].strip() if trainer_raw else "不明"
         jockey = _extract_jockey_from_cell(jockey_td)
         
+        # ★前走騎手取得
         prev_jockey = ""
         if zenso_td:
             m = _PREV_JOCKEY_RE.search(zenso_td.get_text(" ", strip=True))
@@ -391,7 +392,6 @@ def run_dify_workflow_blocking(full_text: str) -> str:
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     
     url = _dify_url("/v1/workflows/run")
-    # ★修正: inputs は text のみ
     payload = {
         "inputs": {"text": full_text},
         "response_mode": "blocking",
@@ -401,7 +401,7 @@ def run_dify_workflow_blocking(full_text: str) -> str:
     sess = get_http_session()
 
     try:
-        # ★修正: タイムアウト300秒
+        # ★タイムアウトを300秒(5分)に設定して粘る
         res = sess.post(url, headers=headers, json=payload, timeout=(10, 300))
         if res.status_code != 200: return _format_http_error(res)
         
@@ -413,15 +413,12 @@ def run_dify_workflow_blocking(full_text: str) -> str:
         return f"⚠️ blocking API Error: {str(e)}"
 
 def run_dify_with_fallback(full_text: str) -> str:
-    """
-    タイムアウトや混雑時にリトライを行うラッパー
-    """
     max_retries = 3
     for attempt in range(max_retries):
         res = run_dify_workflow_blocking(full_text)
         
-        # エラー判定
         is_error = False
+        # エラーワードが含まれていたらリトライ対象とする
         if "⚠️" in res and ("503" in res or "overloaded" in res or "PluginInvokeError" in res):
             is_error = True
         
@@ -490,8 +487,15 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 
                 for uma in all_uma:
                     kg = keibago_dict.get(uma, {})
-                    info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{kg.get('jockey','')} 調教師:{kg.get('trainer','')}"
-                    if kg.get('is_change'): info += " 【⚠️乗り替わり】"
+                    
+                    # ★修正点: 前走騎手をプロンプトに含める
+                    prev_info = ""
+                    if kg.get('is_change'):
+                        pj = kg.get('prev_jockey', '')
+                        prev_info = f" 【⚠️乗り替わり】(前走:{pj})" if pj else " 【⚠️乗り替わり】"
+
+                    info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{kg.get('jockey','')}{prev_info} 調教師:{kg.get('trainer','')}"
+                    
                     merged_text.append(f"{info}\n談話: {danwa_dict.get(uma,'なし')}\n調教: {cyokyo_dict.get(uma,'なし')}")
 
                 if not merged_text:
@@ -507,6 +511,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
 
                 # 3. AI実行
                 _ui_info(ui, "🤖 AI分析中...")
+                # UIなしのイテレータでもリトライ機能付き関数を呼ぶ
                 dify_res = run_dify_with_fallback(prompt)
                 dify_res = (dify_res or "").strip()
 
@@ -520,7 +525,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 
                 _ui_success(ui, "✅ 完了")
                 yield (race_num, final_output)
-                time.sleep(3)
+                time.sleep(3) # 連続アクセス防止の待機
 
             except Exception as e:
                 yield (race_num, f"⚠️ Error: {e}")
