@@ -679,7 +679,7 @@ def run_races_iter(
                     "text": prompt,
                     "date": f"{year}/{month}/{day}",
                     "place": place_name,
-                    "race_no": race_num,
+                    "race_no": str(race_num),  
                     "year": int(year),
                     "month": int(month),
                     "day": int(day)
