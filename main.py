@@ -23,6 +23,7 @@ with st.sidebar:
     st.subheader("対象レース")
     target_races_input = st.text_input("レース番号 (例: 10,11,12)", "10,11,12")
     
+    st.caption("※Difyの生成待ち時間は最大5分です")
     start_btn = st.button("予想開始", type="primary")
 
 # --- メイン処理 ---
@@ -31,7 +32,6 @@ if start_btn:
     month = f"{target_date.month:02}"
     day = f"{target_date.day:02}"
     
-    # レース番号のパース
     try:
         if not target_races_input.strip():
             target_races = None # 全レース
@@ -41,27 +41,24 @@ if start_btn:
         st.error("レース番号の形式が不正です。カンマ区切りで入力してください。")
         st.stop()
 
-    st.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 の予想を開始します...")
+    st.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 の予想を開始します... (通信待機: 最大300秒)")
 
-    # 結果表示用コンテナ
     result_container = st.container()
 
     # ジェネレータから順次取得して表示
     for race_num, output_text in keiba_bot.run_races_iter(year, month, day, place_code, target_races):
         
         if race_num == 0:
-            # エラー等のシステムメッセージ
             st.error(output_text)
         else:
             with result_container:
-                st.markdown(f"### {selected_place} {race_num}R")
+                st.subheader(f"{selected_place} {race_num}R")
                 
-                # コピーしやすいようにコードブロックではなく、テキストエリアを使用
-                # 高さを自動調整できないため、少し大きめに確保
+                # コピーしやすいようにテキストエリアで出力
                 st.text_area(
-                    label=f"{race_num}R 出力結果 (コピー用)",
+                    label=f"{race_num}R 結果 (Ctrl+A -> Ctrl+C でコピー)",
                     value=output_text,
-                    height=400,
+                    height=500,
                     key=f"res_{race_num}"
                 )
                 st.divider()
