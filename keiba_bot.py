@@ -23,6 +23,7 @@ DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 def _build_session() -> requests.Session:
     sess = requests.Session()
+    # リトライ設定: 接続エラーや50xエラー時に3回まで再試行
     retry = Retry(total=3, backoff_factor=1, status_forcelist=(500, 502, 503, 504))
     sess.mount("https://", HTTPAdapter(max_retries=retry))
     return sess
@@ -48,10 +49,10 @@ def login_keibabook(driver: webdriver.Chrome, wait: WebDriverWait):
         driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
         time.sleep(1)
     except:
-        pass # ログイン済み等の場合
+        pass 
 
 # ==================================================
-# スクレイピング関数群 (競馬ブック & keiba.go.jp)
+# スクレイピング関数群
 # ==================================================
 def fetch_race_ids(driver, year, month, day, place_code):
     date_str = f"{year}{month}{day}"
@@ -74,44 +75,35 @@ def fetch_race_ids(driver, year, month, day, place_code):
     return sorted(race_ids)
 
 def get_keibago_data(year, month, day, race_no, baba_code):
-    # 簡易出馬表を取得して、騎手変更情報などを抽出
     date_str = f"{year}/{month}/{day}"
     url = f"https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTableSmall?k_raceDate={date_str}&k_raceNo={race_no}&k_babaCode={baba_code}"
     
     sess = get_http_session()
     try:
-        r = sess.get(url, timeout=10)
+        r = sess.get(url, timeout=15) # タイムアウト設定
         r.encoding = r.apparent_encoding
         soup = BeautifulSoup(r.text, "html.parser")
         
         horses = {}
-        # テーブル構造解析 (簡略化)
         tbl = soup.select_one("table.bs[border='1']")
         if not tbl: return {}, ""
         
         for tr in tbl.find_all("tr"):
             tds = tr.find_all("td")
             if len(tds) < 4: continue
-            
-            # 馬番・馬名取得（構造に依存するためtryで保護）
             try:
                 txts = [td.get_text(strip=True) for td in tds]
-                # 数字が含まれる最初のカラムを馬番と推測
                 umaban = next((t for t in txts if t.isdigit()), None)
                 if not umaban: continue
                 
-                # 騎手情報の抽出（変更有無）
-                # ※ keiba.go.jpの構造は複雑なため、テキスト全体から簡易抽出
                 row_text = tr.get_text(" ", strip=True)
-                is_change = "替" in row_text or "☆" in row_text or "▲" in row_text # 簡易判定
+                is_change = "替" in row_text or "☆" in row_text or "▲" in row_text 
                 
-                # 馬名抽出 (font.bameiタグがあれば優先)
                 bamei_tag = tr.select_one(".bamei")
                 horse_name = bamei_tag.get_text(strip=True) if bamei_tag else "不明"
 
                 horses[umaban] = {"name": horse_name, "is_change": is_change}
             except: continue
-            
         return horses, ""
     except Exception:
         return {}, ""
@@ -120,10 +112,10 @@ def get_keibago_data(year, month, day, race_no, baba_code):
 # ローカル対戦表生成ロジック
 # ==================================================
 def _get_kai_nichi(target_month, target_day, target_place):
-    # 南関競馬公式サイトから開催回・日次を取得
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
+    sess = get_http_session()
     try:
-        res = requests.get(url, timeout=5)
+        res = sess.get(url, timeout=10)
         res.encoding = 'cp932'
         soup = BeautifulSoup(res.text, 'html.parser')
         
@@ -133,7 +125,7 @@ def _get_kai_nichi(target_month, target_day, target_place):
                 m = re.search(r'第(\d+)回.*?(\d+)月\s*(.*?)日', text)
                 if m:
                     mon = int(m.group(2))
-                    if mon != int(target_month): continue # 月違い
+                    if mon != int(target_month): continue
                     days = [int(d) for d in re.findall(r'\d+', m.group(3))]
                     if int(target_day) in days:
                         return int(m.group(1)), days.index(int(target_day)) + 1, None
@@ -142,50 +134,43 @@ def _get_kai_nichi(target_month, target_day, target_place):
         return None, None, str(e)
 
 def _parse_grades(text):
-    # LLM出力から [S] ①馬名... のような評価を抽出
     grades = {}
     if not text: return grades
-    # 行ごとに解析 (簡易実装: | ①馬名(騎手) | ... | A | の形式を想定)
     for line in text.split('\n'):
         if '|' in line and ('①' in line or '②' in line or '1' in line):
             parts = [p.strip() for p in line.split('|') if p.strip()]
             if len(parts) >= 2:
-                # 最後のカラムが評価(S~E)である可能性が高い
                 grade_cand = parts[-1]
                 if grade_cand in ['S','A','B','C','D','E']:
-                    # 馬名を抽出 (①などを除去)
-                    name_part = parts[0] # 先頭カラム
+                    name_part = parts[0]
                     name_clean = re.sub(r'[①-⑳0-9\(\)（）]', '', name_part).split('(')[0]
                     grades[name_clean.strip()] = grade_cand
     return grades
 
 def _fetch_history_data(year, month, day, place_name, race_num, grades):
-    # 回・日次を特定
     kai, nichi, err = _get_kai_nichi(month, day, place_name)
-    if err: kai, nichi = 15, 1 # フォールバック
+    if err: kai, nichi = 15, 1
 
     p_code = {'浦和': '18', '船橋': '19', '大井': '20', '川崎': '21'}.get(place_name, '20')
     race_id = f"{year}{int(month):02}{int(day):02}{p_code}{int(kai):02}{int(nichi):02}{int(race_num):02}"
     url = f"https://www.nankankeiba.com/taisen/{race_id}.do"
+    
+    sess = get_http_session()
 
     try:
-        res = requests.get(url, timeout=10)
+        res = sess.get(url, timeout=15)
         res.encoding = 'cp932'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 対戦表テーブル抽出
         tbl = soup.find('table', class_='nk23_c-table08__table')
         if not tbl: return f"\n(対戦データなし: {url})"
 
-        # 履歴解析
-        history_lines = []
-        thead = tbl.find('thead')
         tbody = tbl.find('tbody')
+        thead = tbl.find('thead')
         if not (thead and tbody): return ""
 
-        # レース情報（列）
         races = []
-        for th in thead.find_all('th')[1:]: # 先頭は馬名欄
+        for th in thead.find_all('th')[1:]:
             link = th.find('a')
             if link:
                 title = th.get_text(strip=True).replace('競走成績', '').replace('対戦表', '')
@@ -194,18 +179,15 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades):
 
         if not races: return "\n(初対戦)"
 
-        # 各馬の着順（行）
         for tr in tbody.find_all('tr'):
             cells = tr.find_all(['td', 'th'])
             if not cells: continue
             
-            # 馬名
             uma_tag = cells[0].find('a')
             if not uma_tag: continue
             h_name = uma_tag.get_text(strip=True)
-            h_grade = _parse_grades_fuzzy(h_name, grades) # 馬名部分一致で評価取得
+            h_grade = _parse_grades_fuzzy(h_name, grades)
 
-            # 各レースの着順
             for i, cell in enumerate(cells[1:]):
                 if i >= len(races): break
                 rank_text = cell.get_text(strip=True).split('｜')[0].strip()
@@ -218,14 +200,12 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades):
                         "sort": sort_k
                     })
 
-        # 出力テキスト生成
         output = ["###注目対戦"]
         has_content = False
         
         for r in races:
             if not r["results"]: continue
             has_content = True
-            # 着順ソート
             r["results"].sort(key=lambda x: x["sort"])
             
             line_items = []
@@ -244,7 +224,6 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades):
         return f"\n(対戦表エラー: {e})"
 
 def _parse_grades_fuzzy(horse_name, grades):
-    # 馬名が完全一致しなくても、含まれていれば評価を返す
     if horse_name in grades: return grades[horse_name]
     for k, v in grades.items():
         if k in horse_name or horse_name in k:
@@ -255,21 +234,25 @@ def _parse_grades_fuzzy(horse_name, grades):
 # Dify連携 & メイン実行
 # ==================================================
 def run_dify_simple(prompt):
-    # ★ Difyには 'text' だけを送るように変更
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "inputs": {"text": prompt}, # シンプル化
+        "inputs": {"text": prompt},
         "response_mode": "blocking",
         "user": "streamlit-user"
     }
+    sess = get_http_session() # リトライ付きセッションを使用
     try:
-        res = requests.post(f"{DIFY_BASE_URL}/v1/workflows/run", headers=headers, json=payload, timeout=60)
+        # ★ここを修正: timeoutを300秒(5分)に設定
+        res = sess.post(f"{DIFY_BASE_URL}/v1/workflows/run", headers=headers, json=payload, timeout=300)
+        
         if res.status_code == 200:
             return res.json().get('data', {}).get('outputs', {}).get('text', "Error: No text output")
         return f"Dify Error: {res.status_code} {res.text}"
+    except requests.exceptions.Timeout:
+        return "⚠️ Dify Timeout: 処理に時間がかかりすぎたため中断されました(300秒超過)。"
     except Exception as e:
         return f"Conn Error: {e}"
 
@@ -293,46 +276,70 @@ def run_races_iter(year, month, day, place_code, target_races):
             race_num = i + 1
             if target_races and race_num not in target_races: continue
 
-            # --- 1. データ取得 (KeibaBook) ---
+            # データ取得
             driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
             html_danwa = driver.page_source
             driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
             html_cyokyo = driver.page_source
             
-            # --- 2. データ取得 (KeibaGO) ---
             kg_horses, _ = get_keibago_data(year, month, day, race_num, baba_code)
 
-            # --- 3. テキスト整形 (Prompt作成) ---
-            # ※ BeautifulSoup解析は長くなるため要約しますが、既存ロジック通りテキスト化
+            # テキスト整形
             soup_d = BeautifulSoup(html_danwa, "html.parser")
             soup_c = BeautifulSoup(html_cyokyo, "html.parser")
             
-            # レース名などのヘッダー情報
-            r_title = soup_d.find("div", class_="racetitle")
-            race_header = r_title.get_text(" ", strip=True) if r_title else "レース情報不明"
+            # 談話データの抽出
+            danwa_map = {}
+            tbl_d = soup_d.find("table", class_="danwa")
+            if tbl_d and tbl_d.tbody:
+                curr_u = None
+                for row in tbl_d.tbody.find_all("tr"):
+                    ud = row.find("td", class_="umaban")
+                    if ud:
+                        curr_u = ud.get_text(strip=True)
+                        continue
+                    td = row.find("td", class_="danwa")
+                    if td and curr_u:
+                        danwa_map[curr_u] = td.get_text(strip=True)
+                        curr_u = None
 
-            # 各馬情報結合
-            prompt_lines = [f"レース: {race_header}", f"日付: {year}/{month}/{day} {place_name} {race_num}R", ""]
-            
-            # 馬ごとのループ処理 (簡易化)
-            # 実際にはここで談話と調教を辞書化して結合する既存ロジックを使用
-            # 今回はプロンプト構築のイメージ
-            
-            # ... (データ結合処理) ...
-            # プロンプト完成と仮定
-            final_prompt = f"{race_header}\n(ここに全馬の談話・調教・騎手変更情報が入る)" 
+            # 調教データの抽出
+            cyokyo_map = {}
+            for t in soup_c.find_all("table", class_="cyokyo"):
+                tb = t.find("tbody")
+                if not tb: continue
+                trs = tb.find_all("tr", recursive=False)
+                if not trs: continue
+                u_td = trs[0].find("td", class_="umaban")
+                if not u_td: continue
+                ub = u_td.get_text(strip=True)
+                # 簡易的に結合
+                cyokyo_map[ub] = trs[0].get_text(" ", strip=True) + (trs[1].get_text(" ", strip=True) if len(trs)>1 else "")
 
-            # --- 4. Dify実行 (テキストのみ送信) ---
+            # レース名
+            rt = soup_d.find("div", class_="racetitle")
+            race_header = rt.get_text(" ", strip=True) if rt else f"{place_name} {race_num}R"
+
+            # プロンプト作成
+            lines = [f"{race_header} (日時:{year}/{month}/{day})"]
+            all_uma = sorted(set(danwa_map.keys()) | set(cyokyo_map.keys()) | set(kg_horses.keys()), key=lambda x: int(x) if x.isdigit() else 999)
+
+            for u in all_uma:
+                kg = kg_horses.get(u, {})
+                d_txt = danwa_map.get(u, "なし")
+                c_txt = cyokyo_map.get(u, "なし")
+                base_info = f"【馬番{u}】{kg.get('name','')} (変:{'有' if kg.get('is_change') else '無'})"
+                lines.append(f"{base_info}\n談話:{d_txt}\n調教:{c_txt}")
+            
+            final_prompt = "\n".join(lines)
+
+            # Dify実行
             dify_res = run_dify_simple(final_prompt)
 
-            # --- 5. ローカルで対戦表生成 ---
-            # Difyの結果から評価(S,A...)を抽出
+            # ローカル対戦表生成
             grades = _parse_grades(dify_res)
-            # 対戦履歴取得
             history_text = _fetch_history_data(year, month, day, place_name, race_num, grades)
 
-            # --- 6. 結合して返却 ---
-            # 2枚目の添付画像の通り、自動判定ヘッダーなどをつける
             header_info = f"📅 自動判定: {year}年{month}月{day}日 {place_name} {race_num}R"
             full_output = f"{header_info}\n\n{dify_res}\n\n{history_text}"
 
