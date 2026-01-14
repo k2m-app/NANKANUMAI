@@ -254,18 +254,18 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     return header, horses, url, nar_race_level
 
 # ==================================================
-# ★開催情報（回・日次）判定ロジック（南関公式サイト解析）
+# ★開催情報（回・日次）判定ロジック（修正版）
 # ==================================================
 def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
     """
-    https://www.nankankeiba.com/bangumi_menu/bangumi.do をスクレイピングして、
-    指定された競馬場の「第X回 Y日目」を正確に特定する。
+    南関公式サイトから「第X回 Y日目」を特定する。
+    特殊文字（&nbsp;など）を含んでも柔軟に解析できるように修正。
     """
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
     sess = get_http_session()
     try:
         res = sess.get(url, timeout=10)
-        res.encoding = 'cp932' # 南関はShift_JIS/cp932
+        res.encoding = 'cp932' # Shift_JIS
         soup = BeautifulSoup(res.text, 'html.parser')
         
         target_row = None
@@ -282,13 +282,19 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
 
         # 3番目のtd（開催情報セル）を取得
         info_td = target_row.find_all('td')[2]
-        info_text = info_td.get_text(" ", strip=True) # 例: "第15回 1月 12, 13, 14, 15, 16日"
+        
+        # ★修正ポイント：テキスト取得後に正規化（nbspなどを半角スペースへ）
+        # .get_text(" ", strip=True) だけだと &nbsp; がうまく処理されない場合があるため
+        info_text = info_td.get_text(" ", strip=True)
+        info_text = info_text.replace('\u00a0', ' ').replace('\u3000', ' ') # nbsp, 全角スペース除去
 
-        # 正規表現で解析
-        # 例: 第15回 1月 12, 13, 14, 15, 16日
-        m = re.search(r'第(\d+)回.*?(\d+)月\s*(.*?)日', info_text)
+        # ★修正ポイント：正規表現を緩くする
+        # "第" [スペースや文字] "数字" [スペース] "回" ... "数字" [スペース] "月"
+        # 例: 第 15 回 1月 12, 13...
+        m = re.search(r'第\s*(\d+)\s*回[^\d]*(\d+)\s*月\s*(.*?)\s*日', info_text)
+        
         if not m:
-             # リンクがない（開催予定なし）場合など
+             # 開催がない場合はここに来る可能性がある
              return 0, 0, f"開催情報パース不可: {info_text}"
 
         kai = int(m.group(1))
@@ -492,7 +498,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
             yield (0, "⚠️ レースID取得失敗")
             return
 
-        # 2. ★修正: ここで南関競馬サイトから「第X回Y日目」を一度だけ取得する
+        # 2. ★南関公式サイトから「第X回Y日目」を取得
         _ui_info(ui, f"📅 開催情報（回・日次）を解析中... ({place_name} {month}/{day})")
         kai_val, nichi_val, date_err = _get_kai_nichi_from_web(month, day, place_name)
         
