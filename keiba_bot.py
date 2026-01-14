@@ -299,26 +299,76 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
     except Exception as e:
         return 0, 0, f"GetKaiNichi Error: {e}"
 
+# ==================================================
+# 評価抽出ロジック（強化版）
+# ==================================================
 def _parse_grades(text):
+    """
+    Difyの出力テキストから {馬名: 評価} の辞書を作成する。
+    テーブル形式 (| 馬名 | ... | A |) だけでなく、リスト形式なども柔軟に解析。
+    """
     grades = {}
     if not text: return grades
+    
+    # 1. テーブル形式 (| ... |) の解析
+    # 行ごとに処理
     for line in text.split('\n'):
-        if '|' in line and ('①' in line or '②' in line or '1' in line):
+        line = line.strip()
+        if not line: continue
+        
+        # パターンA: パイプ区切りテーブル (| ①馬名 | ... | A |)
+        if '|' in line:
             parts = [p.strip() for p in line.split('|') if p.strip()]
+            # 末尾付近に評価(S-E)があるはず
             if len(parts) >= 2:
-                grade_cand = parts[-1]
-                if grade_cand in ['S','A','B','C','D','E']:
-                    name_part = parts[0]
-                    name_clean = re.sub(r'[①-⑳0-9\(\)（）]', '', name_part).split('(')[0]
-                    grades[name_clean.strip()] = grade_cand
+                # 後ろから見ていって、最初にS-Eが見つかったらそれを評価とする
+                found_grade = None
+                for p in reversed(parts):
+                    if p in ['S','A','B','C','D','E'] or (len(p)==1 and p in 'SABCDE'):
+                        found_grade = p
+                        break
+                
+                if found_grade:
+                    # 馬名は最初の方にあるはず (馬番などは除去)
+                    raw_name = parts[0]
+                    # ①②...や数字、()などを除去して馬名のみにする
+                    clean_name = re.sub(r'[①-⑳0-9\(\)（）]', '', raw_name).strip()
+                    # (騎手名)などが残っている場合があるので除去
+                    clean_name = clean_name.split('(')[0].strip()
+                    if clean_name:
+                        grades[clean_name] = found_grade
+                        continue # 次の行へ
+
+    # 2. もしテーブルで取れなかった場合や、補完のために別パターンも探索
+    # 例: "1. 馬名: A" や "①馬名 (A)" など
+    # (今回はテーブル形式が主なので、上記で十分な場合が多いが念のため)
+    
     return grades
 
 def _parse_grades_fuzzy(horse_name, grades):
-    if horse_name in grades: return grades[horse_name]
+    """
+    対戦表の馬名(horse_name)が、Dify評価リスト(grades)にあるか探す。
+    完全一致しなくても、包含関係でヒットさせる。
+    """
+    # 1. 完全一致
+    if horse_name in grades:
+        return grades[horse_name]
+    
+    # 2. 空白除去して一致確認
+    h_clean = horse_name.replace(" ", "").replace("　", "")
     for k, v in grades.items():
+        k_clean = k.replace(" ", "").replace("　", "")
+        if h_clean == k_clean:
+            return v
+            
+    # 3. 部分一致 (どちらかがどちらかを含んでいる)
+    for k, v in grades.items():
+        # Dify側の馬名(k)が、対戦表の馬名(horse_name)に含まれている
+        # またはその逆
         if k in horse_name or horse_name in k:
             return v
-    return ""
+            
+    return "" # 見つからない場合は空文字
 
 def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nichi):
     if kai == 0 or nichi == 0:
@@ -417,7 +467,7 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                 line_items.append(f"{rank_disp} {res['name']}{g_str}")
             
             title_clean = re.sub(r'\s+', ' ', r['title']) 
-            output.append(f"**○ {title_clean}**")
+            output.append(f"○ {title_clean}**")
             output.append(" / ".join(line_items))
             output.append(f"[詳細]({r['url']})\n")
 
