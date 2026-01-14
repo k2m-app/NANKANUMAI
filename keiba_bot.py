@@ -61,7 +61,7 @@ def login_keibabook(driver: webdriver.Chrome, wait: WebDriverWait):
     time.sleep(1)
 
 # ==================================================
-# 1. 競馬ブック等のスクレイピング関数 (復活させた部分)
+# 1. 競馬ブック等のスクレイピング関数
 # ==================================================
 def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui: bool = False):
     date_str = f"{year}{month}{day}"
@@ -350,18 +350,25 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
                 detail = cell.find(class_='nk23_c-table08__detail')
                 raw = detail.get_text(strip=True) if detail else cell.get_text(strip=True)
                 info = _clean_text_strict(raw.replace('競走成績','').replace('対戦表',''))
+                
+                # resultのURLをそのまま使う (liveonには変換しない)
+                result_url = "https://www.nankankeiba.com" + link['href']
+                
+                # race_id抽出 (ソート用)
+                rid_match = re.search(r'/result/(\d+)', link['href'])
+                rid = rid_match.group(1) if rid_match else "0"
+
                 past_races.append({
                     'info': info, 
-                    'url': "https://www.nankankeiba.com" + link['href'], 
-                    'results': [], 'max_score': 0, 'grades': []
+                    'url': result_url, 
+                    'id': rid, # ソート用のID
+                    'results': [] # (着順, 評価, 馬名) のタプルを入れる
                 })
 
-        if not past_races: return "\n(過去の対戦履歴なし)"
+        if not past_races: return "\n(初対戦)"
 
         tbody = target_table.find('tbody')
         if not tbody: return "\n(データ行なし)"
-        
-        rank_score = {'S': 5, 'A': 4, 'B': 3, 'C': 2, 'D': 1}
         
         for row in tbody.find_all('tr'):
             uma_link = row.find('a', href=re.compile(r'/uma_info/'))
@@ -385,46 +392,66 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
             for col_idx, race_obj in enumerate(past_races):
                 if col_idx < len(result_cells):
                     cell = result_cells[col_idx]
-                    rank = ""
+                    rank_num = 999
+                    rank_str = ""
+                    
                     num_tag = cell.find(class_='nk23_c-table08__number')
                     if num_tag:
                         span = num_tag.find('span')
-                        rank = span.get_text(strip=True) if span else num_tag.get_text(strip=True).split('｜')[0].strip()
+                        rank_str = span.get_text(strip=True) if span else num_tag.get_text(strip=True).split('｜')[0].strip()
                     else:
                         txt = cell.get_text(strip=True)
                         if txt:
                             p = txt.split('｜')[0].strip()
-                            if p.isdigit() or p in ['除外','中止','取消']: rank = p
+                            if p.isdigit() or p in ['除外','中止','取消']: rank_str = p
                     
-                    if rank:
-                        mark = f"【{grade}】" if grade else ""
-                        race_obj['results'].append(f"{rank}着 {mark}{horse_name}")
-                        if grade:
-                            s = rank_score.get(grade, 0)
-                            if s > race_obj['max_score']: race_obj['max_score'] = s
-                            race_obj['grades'].append(grade)
+                    if rank_str:
+                        if rank_str.isdigit():
+                            rank_num = int(rank_str)
+                        # 結果を追加 (ソート用数値, 表示用文字列, 評価, 馬名)
+                        race_obj['results'].append({
+                            'sort_key': rank_num,
+                            'disp_rank': rank_str,
+                            'grade': grade,
+                            'name': horse_name
+                        })
 
-        past_races.sort(key=lambda x: (x['max_score'], len(x['grades'])), reverse=True)
+        # 4. ソートと出力生成 (変更点反映)
+        # 日付順（新しい順）＝ IDの降順
+        past_races.sort(key=lambda x: x['id'], reverse=True)
         
-        output = ["### 📊 注目対戦 (Streamlit自動生成)"]
+        output = ["### 📊 注目対戦"] # タイトル変更
         has_data = False
+        
         for race in past_races:
             if race['results']:
                 has_data = True
-                icon = "🔥" if race['max_score'] >= 5 else ("✨" if race['max_score'] >= 4 else "🔹")
-                liveon = race['url'].replace('result', 'liveon')
-                output.append(f"**{icon} {race['info']}**")
-                output.append(" / ".join(race['results']))
-                output.append(f"[映像・詳細]({liveon})\n")
+                
+                # 着順ソート (数字昇順 -> その他)
+                race['results'].sort(key=lambda x: x['sort_key'])
+                
+                # 表示文字列作成: "1着 馬名(A)" 形式
+                res_strs = []
+                for r in race['results']:
+                    grade_str = f"({r['grade']})" if r['grade'] else ""
+                    # 数字の場合: "1着 馬名(A)"
+                    # 文字の場合: "取消 馬名(A)"
+                    prefix = f"{r['disp_rank']}着" if r['disp_rank'].isdigit() else r['disp_rank']
+                    res_strs.append(f"{prefix} {r['name']}{grade_str}")
+                
+                # URLはそのままresultを使用、表記は[詳細]
+                output.append(f"**🔹 {race['info']}**")
+                output.append(" / ".join(res_strs))
+                output.append(f"[詳細]({race['url']})\n")
         
-        if not has_data: return "\n(該当データなし)"
+        if not has_data: return "\n(初対戦)"
         return "\n".join(output)
 
     except Exception as e:
         return f"\n(対戦表エラー: {e})"
 
 # ==================================================
-# 3. Dify連携 (シンプル版)
+# 3. Dify連携
 # ==================================================
 def run_dify(inputs_dict):
     url = f"{DIFY_BASE_URL}/v1/workflows/run"
@@ -432,14 +459,11 @@ def run_dify(inputs_dict):
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json"
     }
-    # Dify側は 'text' を入力として待っている(Startノードの設定による)
-    # 辞書を丸ごと送ることで dateなども渡るようにする
     payload = {
         "inputs": inputs_dict,
         "response_mode": "blocking",
         "user": "streamlit-user"
     }
-    
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=60)
         if res.status_code == 200:
@@ -467,7 +491,6 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
     wait = WebDriverWait(driver, 10)
     
     try:
-        # 1. ログイン & レースID取得
         login_keibabook(driver, wait)
         race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
         
@@ -481,24 +504,20 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 continue
             
             try:
-                # 2. スクレイピング
-                # keiba.go.jp
+                # スクレイピング
                 header, keibago_dict, keibago_url, nar_race_level = fetch_keibago_debatable_small(
                     year=str(year), month=str(month), day=str(day),
                     race_no=race_num, baba_code=str(baba_code)
                 )
                 
-                # 競馬ブック (談話)
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
                 html_danwa = driver.page_source
                 race_meta = parse_race_info(html_danwa)
                 danwa_dict = parse_danwa_comments(html_danwa)
                 
-                # 競馬ブック (調教)
                 driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
                 cyokyo_dict = parse_cyokyo(driver.page_source)
                 
-                # データ結合
                 all_uma = sorted(
                     set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(keibago_dict.keys()),
                     key=lambda x: int(x) if str(x).isdigit() else 999,
@@ -524,7 +543,6 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                     + "\n".join(merged_text)
                 )
                 
-                # 3. Dify実行 (予想テキスト生成)
                 dify_inputs = {
                     "text": prompt,
                     "date": f"{year}/{month}/{day}",
@@ -536,7 +554,6 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 }
                 dify_res = run_dify(dify_inputs)
                 
-                # 4. Streamlit側で対戦表を作成＆結合
                 final_output = generate_battle_table_local(
                     dify_res, year, month, day, place_name, race_num
                 )
@@ -547,6 +564,5 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 yield race_num, f"⚠️ Error: {e}"
             
             time.sleep(2)
-
     finally:
         driver.quit()
