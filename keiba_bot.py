@@ -440,7 +440,7 @@ def _fetch_history_data(year, month, day, place_name, kai, nichi, race_num, grad
                     res_strs.append(f"{prefix} {r['name']}{grade_str}")
                 
                 # URLはそのままresultを使用、表記は[詳細]
-                output.append(f"**🔹 {race['info']}**")
+                output.append(f"**・ {race['info']}**")
                 output.append(" / ".join(res_strs))
                 output.append(f"[詳細]({race['url']})\n")
         
