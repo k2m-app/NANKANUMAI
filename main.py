@@ -20,32 +20,47 @@ with st.sidebar:
     st.divider()
     st.subheader("対象レース選択")
     
-    # セッションステート初期化
+    # 1. セッションステート初期化（リスト）
     if "selected_races" not in st.session_state:
         st.session_state.selected_races = [10, 11, 12]
-    
-    # 結果保存用のステート初期化
-    if "results_cache" not in st.session_state:
-        st.session_state.results_cache = {}
 
-    # 全選択/解除ボタン
+    # 2. リストの内容を個別のチェックボックス用ステート(chk_N)に同期させる
+    #    (初回ロード時や、外部からリストが変更された場合用)
+    for r in range(1, 13):
+        key_name = f"chk_{r}"
+        if key_name not in st.session_state:
+            st.session_state[key_name] = (r in st.session_state.selected_races)
+
+    # 3. コールバック関数の定義（全選択・全解除用）
+    def update_all_checkboxes(state: bool):
+        for r in range(1, 13):
+            st.session_state[f"chk_{r}"] = state
+
+    # 4. 全選択/解除ボタン（on_clickでステートを直接操作）
     col_a, col_c = st.columns(2)
-    if col_a.button("全選択"):
-        st.session_state.selected_races = list(range(1, 13))
-    if col_c.button("全解除"):
-        st.session_state.selected_races = []
+    with col_a:
+        st.button("全選択", on_click=update_all_checkboxes, args=(True,))
+    with col_c:
+        st.button("全解除", on_click=update_all_checkboxes, args=(False,))
 
-    # チェックボックスグリッド
+    # 5. チェックボックスグリッドの描画
     selected_races_final = []
     cols = st.columns(3)
     for r in range(1, 13):
         with cols[(r-1)%3]:
-            # keyをユニークにして状態管理
-            checked = st.checkbox(f"{r}R", value=(r in st.session_state.selected_races), key=f"chk_{r}")
+            # keyを指定することでsession_stateと紐付け
+            # value引数はsession_stateにkeyがある場合無視されるため、
+            # 上記のupdate_all_checkboxesで直接stateを弄るのが正解です
+            checked = st.checkbox(f"{r}R", key=f"chk_{r}")
             if checked:
                 selected_races_final.append(r)
     
+    # 最新の状態をリストに保存
     st.session_state.selected_races = selected_races_final
+
+    # 結果保存用のステート初期化
+    if "results_cache" not in st.session_state:
+        st.session_state.results_cache = {}
 
     st.caption("※Dify生成待機: 最大10分/レース")
     
