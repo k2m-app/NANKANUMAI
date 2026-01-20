@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 # 【設定】ファイルパス設定
 # ==================================================
 NAME_LIST_FILE = "NAR.csv"          # 騎手・調教師名リスト
-STATS_FILE = "騎手調教師_2025.csv"  # 相性データCSV（新ファイル）
+STATS_FILE = "騎手調教師_2025.csv"  # 相性データCSV
 
 # ==================================================
 # 【設定】Secrets読み込み
@@ -30,35 +30,46 @@ DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 # ==================================================
-# ★名前＆相性データ読み込みロジック
+# ★名前＆相性データ読み込みロジック（修正版）
 # ==================================================
 @st.cache_resource
 def load_data_resources():
     """
     名前リストと相性データをメモリに読み込む
+    Professional Fix: encoding='utf-8-sig' でBOM問題を解決し、ヘッダーの空白除去で堅牢性を確保
     """
     resources = {"names": [], "stats": {}}
     
     # 1. 名前リスト (NAR.csv)
     if os.path.exists(NAME_LIST_FILE):
         try:
-            with open(NAME_LIST_FILE, "r", encoding="utf-8") as f:
+            with open(NAME_LIST_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
+                    # 全角/半角カンマ、スペースを除去してクリーンにする
                     clean_line = line.strip().replace("，", "").replace(",", "")
                     if clean_line:
                         resources["names"].append(clean_line)
             print(f"✅ Names loaded: {len(resources['names'])}")
         except Exception as e:
             print(f"⚠️ Names loading error: {e}")
+    else:
+        print(f"ℹ️ {NAME_LIST_FILE} not found. Skipping name normalization.")
 
     # 2. 相性データ (騎手調教師_2025.csv)
-    # フォーマット: 騎手名, 調教師名, 出走回数, 1着, 2着, 3着, 勝率, 複勝率
+    # フォーマット想定: 騎手名, 調教師名, 出走回数, 1着, 2着, 3着, 勝率, 複勝率
     if os.path.exists(STATS_FILE):
         try:
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
+            # 【重要】utf-8-sig を使用してBOM付きCSVに対応
+            with open(STATS_FILE, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
+                
+                # 【重要】ヘッダーの余分な空白を削除（' 騎手名' -> '騎手名'）
+                if reader.fieldnames:
+                    reader.fieldnames = [h.strip() for h in reader.fieldnames]
+
                 count = 0
                 for row in reader:
+                    # 値の前後の空白も除去
                     jockey = row.get('騎手名', '').strip()
                     trainer = row.get('調教師名', '').strip()
                     
@@ -66,10 +77,11 @@ def load_data_resources():
                     
                     # 数値データの取得と計算
                     try:
-                        total = int(row.get('出走回数', 0))
-                        w1 = int(row.get('1着', 0))
-                        w2 = int(row.get('2着', 0))
-                        w3 = int(row.get('3着', 0))
+                        # 数値が空欄の場合は0として扱う安全設計
+                        total = int(row.get('出走回数', 0) or 0)
+                        w1 = int(row.get('1着', 0) or 0)
+                        w2 = int(row.get('2着', 0) or 0)
+                        w3 = int(row.get('3着', 0) or 0)
                         others = total - (w1 + w2 + w3)
                         
                         win_rate = row.get('勝率', '0%').strip()
@@ -77,30 +89,33 @@ def load_data_resources():
                         
                         record_str = f"{w1}-{w2}-{w3}-{others}"
                         
-                        # 検索キーを作成
+                        # 検索キーを作成 (タプル)
                         key = (jockey, trainer)
                         resources["stats"][key] = f"【相性】勝率:{win_rate} 複勝率:{fuku_rate} ({record_str})"
                         count += 1
                     except ValueError:
-                        continue # 数値変換エラーの行はスキップ
+                        continue # 数値変換できない行はスキップ
                         
             print(f"✅ Stats loaded: {count} pairs")
         except Exception as e:
             print(f"⚠️ Stats loading error: {e}")
+    else:
+        print(f"ℹ️ {STATS_FILE} not found. Skipping stats loading.")
             
     return resources
 
 def find_best_match(abbrev, name_list):
-    """ 略称 -> 正式名称 """
+    """ 略称 -> 正式名称への変換ロジック """
     if not abbrev: return "不明"
     abbrev_clean = abbrev.replace(" ", "").replace("　", "")
     if not name_list: return abbrev
     
-    # 完全一致
+    # 1. 完全一致チェック
     if abbrev_clean in name_list: return abbrev_clean
 
-    # 正規表現マッチング
+    # 2. 正規表現によるあいまいマッチング
     try:
+        # "御神訓" -> "御.*神.*訓"
         pattern_str = ".*".join(list(abbrev_clean))
         regex = re.compile(pattern_str)
     except:
@@ -108,11 +123,16 @@ def find_best_match(abbrev, name_list):
 
     candidates = []
     for fname in name_list:
+        # 文字順序が一致 かつ 先頭文字（苗字）が一致するもの
         if regex.search(fname) and fname.startswith(abbrev_clean[0]):
             candidates.append(fname)
     
-    if len(candidates) == 1: return candidates[0]
-    elif len(candidates) > 1: return min(candidates, key=len)
+    if len(candidates) == 1:
+        return candidates[0]
+    elif len(candidates) > 1:
+        # 複数候補がある場合は最も短い名前（略称に近い）を採用
+        return min(candidates, key=len)
+    
     return abbrev
 
 def get_compatibility(jockey, trainer, stats_db):
@@ -121,7 +141,6 @@ def get_compatibility(jockey, trainer, stats_db):
     
     key = (jockey, trainer)
     
-    # データがあれば詳細を、なければ「なし」を返す
     if key in stats_db:
         return stats_db[key]
     else:
@@ -142,9 +161,16 @@ def _ui_markdown(ui, msg):
 @st.cache_resource
 def get_http_session() -> requests.Session:
     sess = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(500, 502, 503, 504))
+    # リトライ戦略の強化
+    retry = Retry(
+        total=3, 
+        backoff_factor=0.6, 
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=["POST", "GET"]
+    )
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
     return sess
 
 # ==================================================
@@ -156,6 +182,8 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1400,2200")
+    # 不要なログを抑制
+    options.add_argument("--log-level=3")
     return webdriver.Chrome(options=options)
 
 def login_keibabook(driver, wait):
@@ -188,7 +216,7 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui
                 seen.add(rid)
     return sorted(race_ids)
 
-# メタ情報取得
+# --- スクレイピングデータ解析関数群 ---
 def parse_race_info(html):
     soup = BeautifulSoup(html, "html.parser")
     racetitle = soup.find("div", class_="racetitle")
@@ -201,7 +229,6 @@ def parse_race_info(html):
     cond = sub_p[1].get_text(" ", strip=True) if len(sub_p) >= 2 else ""
     return {"race_name": race_name, "cond": cond}
 
-# 談話取得
 def parse_danwa_comments(html):
     soup = BeautifulSoup(html, "html.parser")
     danwa_dict = {}
@@ -219,7 +246,6 @@ def parse_danwa_comments(html):
                 current_uma = None
     return danwa_dict
 
-# 調教取得
 def parse_cyokyo(html):
     soup = BeautifulSoup(html, "html.parser")
     cyokyo_dict = {}
@@ -242,7 +268,10 @@ def parse_cyokyo(html):
     return cyokyo_dict
 
 # --- keiba.go.jp 出馬表パース ---
-_KEIBAGO_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+_KEIBAGO_UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+}
 _WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")
 _PREV_JOCKEY_RE = re.compile(r"\d+人\s+([☆▲△◇]?\s*\S+)\s+\d{1,2}\.\d")
 
@@ -271,6 +300,8 @@ def fetch_keibago_debatable_small(year, month, day, race_no, baba_code):
     nar_race_level = ""
     title_span = soup.select_one("span.midium")
     if title_span: nar_race_level = title_span.get_text(strip=True)
+    
+    # セレクタの堅牢化
     main_table = soup.select_one("td.dbtbl table.bs[border='1']") or soup.select_one("table.bs[border='1']")
     horses = {}
     if not main_table: return header, horses, url, nar_race_level
@@ -280,6 +311,7 @@ def fetch_keibago_debatable_small(year, month, day, race_no, baba_code):
         if not tr.select_one("font.bamei"): continue
         tds = tr.find_all("td", recursive=False)
         if len(tds) < 8: continue
+        
         first_txt = tds[0].get_text(strip=True)
         waku_present = first_txt.isdigit() and len(tds) >= 9
         if waku_present and not tds[1].get_text(strip=True).isdigit(): waku_present = False
@@ -312,7 +344,11 @@ def fetch_keibago_debatable_small(year, month, day, race_no, baba_code):
             if m: prev_jockey = m.group(1).strip().replace(" ", "")
         
         is_change = bool(prev_jockey and jockey and _norm_name(prev_jockey) != _norm_name(jockey))
-        horses[str(umaban)] = {"waku": str(waku), "umaban": str(umaban), "horse": horse, "trainer": trainer, "jockey": jockey, "prev_jockey": prev_jockey, "is_change": is_change}
+        horses[str(umaban)] = {
+            "waku": str(waku), "umaban": str(umaban), "horse": horse, 
+            "trainer": trainer, "jockey": jockey, 
+            "prev_jockey": prev_jockey, "is_change": is_change
+        }
     return header, horses, url, nar_race_level
 
 # --- 開催情報判定 ---
@@ -345,17 +381,25 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
     except Exception as e: return 0, 0, f"Error: {e}"
 
 # --- Dify連携 & 対戦表 ---
-def _dify_url(path): return f"{(DIFY_BASE_URL or '').strip().rstrip('/')}{path}"
+def _dify_url(path): 
+    return f"{(DIFY_BASE_URL or '').strip().rstrip('/')}{path}"
+
 def run_dify_with_blocking_robust(full_text):
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     url = _dify_url("/v1/workflows/run")
-    payload = {"inputs": {"text": full_text}, "response_mode": "blocking", "user": "keiba-bot"}
+    payload = {
+        "inputs": {"text": full_text}, 
+        "response_mode": "blocking", 
+        "user": "keiba-bot"
+    }
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
     sess = get_http_session()
+    
     for attempt in range(3):
         try:
             res = sess.post(url, headers=headers, json=payload, timeout=(10, 600))
             if res.status_code != 200:
+                # サーバーエラー系はリトライ
                 if res.status_code in [500, 502, 503, 504] and attempt < 2:
                     time.sleep(10)
                     continue
@@ -363,7 +407,8 @@ def run_dify_with_blocking_robust(full_text):
             j = res.json() or {}
             outputs = j.get("data", {}).get("outputs", {})
             return outputs.get("text") or str(outputs)
-        except Exception as e: return f"⚠️ API Error: {e}"
+        except Exception as e:
+            return f"⚠️ API Error: {e}"
     return "⚠️ Retry Failed"
 
 def _parse_grades(text):
@@ -414,7 +459,11 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                     det = col.find(class_='nk23_c-table08__detail')
                     if det:
                         link = col.find('a', href=re.compile(r'/result/\d+'))
-                        races.append({"title": det.get_text(" ", strip=True), "url": "https://www.nankankeiba.com" + link.get('href','') if link else "", "results": []})
+                        races.append({
+                            "title": det.get_text(" ", strip=True), 
+                            "url": "https://www.nankankeiba.com" + link.get('href','') if link else "", 
+                            "results": []
+                        })
         
         if not races: return "\n(初対戦)"
         tbody = tbl.find('tbody')
@@ -439,7 +488,12 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
                     span = num_p.find('span')
                     rank = span.get_text(strip=True) if span else num_p.get_text(strip=True).split('｜')[0].strip()
                 if rank and (rank.isdigit() or rank in ['除外','中止','取消']):
-                    races[i]["results"].append({"rank": rank, "name": horse_name, "grade": h_grade, "sort": int(rank) if rank.isdigit() else 999})
+                    races[i]["results"].append({
+                        "rank": rank, 
+                        "name": horse_name, 
+                        "grade": h_grade, 
+                        "sort": int(rank) if rank.isdigit() else 999
+                    })
         
         output = ["==注目の対戦=="]
         has_content = False
