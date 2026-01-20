@@ -30,22 +30,27 @@ DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 # ==================================================
-# ★名前＆相性データ読み込みロジック（修正版）
+# ★名前＆相性データ読み込みロジック（完全修正版）
 # ==================================================
 @st.cache_resource
 def load_data_resources():
     """
     名前リストと相性データをメモリに読み込む
-    Professional Fix: encoding='utf-8-sig' でBOM問題を解決し、ヘッダーの空白除去で堅牢性を確保
+    Professional Fix: 
+    - 内部の空白(全角/半角)を全て除去してキーにする「完全正規化」を導入
+    - utf-8-sig対応でBOM問題を解決
+    - ヘッダーの空白除去でKeyErrorを防止
     """
     resources = {"names": [], "stats": {}}
     
+    # -------------------------------------------------
     # 1. 名前リスト (NAR.csv)
+    # -------------------------------------------------
     if os.path.exists(NAME_LIST_FILE):
         try:
             with open(NAME_LIST_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
-                    # 全角/半角カンマ、スペースを除去してクリーンにする
+                    # カンマ、スペースを除去してリスト化
                     clean_line = line.strip().replace("，", "").replace(",", "")
                     if clean_line:
                         resources["names"].append(clean_line)
@@ -55,29 +60,33 @@ def load_data_resources():
     else:
         print(f"ℹ️ {NAME_LIST_FILE} not found. Skipping name normalization.")
 
+    # -------------------------------------------------
     # 2. 相性データ (騎手調教師_2025.csv)
-    # フォーマット想定: 騎手名, 調教師名, 出走回数, 1着, 2着, 3着, 勝率, 複勝率
+    # -------------------------------------------------
     if os.path.exists(STATS_FILE):
         try:
-            # 【重要】utf-8-sig を使用してBOM付きCSVに対応
             with open(STATS_FILE, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 
-                # 【重要】ヘッダーの余分な空白を削除（' 騎手名' -> '騎手名'）
+                # 【重要】ヘッダーのクリーニング（余分な空白を削除）
+                # ' 騎手名 ' -> '騎手名' のように修正
                 if reader.fieldnames:
-                    reader.fieldnames = [h.strip() for h in reader.fieldnames]
+                    reader.fieldnames = [h.strip().replace(' ', '').replace('　', '') for h in reader.fieldnames]
 
                 count = 0
                 for row in reader:
-                    # 値の前後の空白も除去
-                    jockey = row.get('騎手名', '').strip()
-                    trainer = row.get('調教師名', '').strip()
+                    # 【重要】値の取得時に内部の空白もすべて削除してキーにする
+                    raw_jockey = row.get('騎手名', '')
+                    raw_trainer = row.get('調教師名', '')
                     
-                    if not jockey or not trainer: continue
+                    # 検索用キー（スペースなし）を作成
+                    jockey_key = raw_jockey.replace(" ", "").replace("　", "")
+                    trainer_key = raw_trainer.replace(" ", "").replace("　", "")
+                    
+                    if not jockey_key or not trainer_key: continue
                     
                     # 数値データの取得と計算
                     try:
-                        # 数値が空欄の場合は0として扱う安全設計
                         total = int(row.get('出走回数', 0) or 0)
                         w1 = int(row.get('1着', 0) or 0)
                         w2 = int(row.get('2着', 0) or 0)
@@ -89,14 +98,16 @@ def load_data_resources():
                         
                         record_str = f"{w1}-{w2}-{w3}-{others}"
                         
-                        # 検索キーを作成 (タプル)
-                        key = (jockey, trainer)
+                        # 検索キーをタプルで作成
+                        key = (jockey_key, trainer_key)
+                        
+                        # データ格納
                         resources["stats"][key] = f"【相性】勝率:{win_rate} 複勝率:{fuku_rate} ({record_str})"
                         count += 1
                     except ValueError:
-                        continue # 数値変換できない行はスキップ
+                        continue # 数値変換エラーの行はスキップ
                         
-            print(f"✅ Stats loaded: {count} pairs")
+            print(f"✅ Stats loaded: {count} pairs (Normalized keys)")
         except Exception as e:
             print(f"⚠️ Stats loading error: {e}")
     else:
@@ -136,10 +147,18 @@ def find_best_match(abbrev, name_list):
     return abbrev
 
 def get_compatibility(jockey, trainer, stats_db):
-    """ 騎手と調教師のペアから相性データを取得 """
+    """ 
+    騎手と調教師のペアから相性データを取得 
+    入力された名前からもスペースを排除して照合する
+    """
     if not jockey or not trainer: return "(データ不足)"
     
-    key = (jockey, trainer)
+    # 【重要】検索時もキーを完全正規化（スペース除去）する
+    # これにより "笹川 翼" と "笹川翼" を同一視させる
+    j_key = jockey.replace(" ", "").replace("　", "")
+    t_key = trainer.replace(" ", "").replace("　", "")
+    
+    key = (j_key, t_key)
     
     if key in stats_db:
         return stats_db[key]
@@ -564,6 +583,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                     full_trainer = find_best_match(kg.get('trainer', ''), name_list)
 
                     # 2. 相性データ取得
+                    # 修正点: get_compatibility 内部でスペースを完全除去して照合します
                     compatibility_info = get_compatibility(full_jockey, full_trainer, stats_db)
                     
                     # 表示用テキスト作成
