@@ -1,6 +1,6 @@
 import time
-import json
 import re
+import os
 import requests
 import streamlit as st
 
@@ -15,12 +15,88 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ==================================================
+# 【設定】ファイルパス設定
+# ==================================================
+# 騎手・調教師が混在しているCSVファイルを指定
+NAME_LIST_FILE = "NAR.csv"
+
+# ==================================================
 # 【設定】Secrets読み込み
 # ==================================================
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
+
+# ==================================================
+# ★名前変換ロジック (統合リスト版)
+# ==================================================
+@st.cache_resource
+def load_name_list():
+    """
+    NAR.csv から全ての名前（騎手・調教師）を読み込んでリスト化する
+    """
+    full_names = []
+    
+    if os.path.exists(NAME_LIST_FILE):
+        try:
+            with open(NAME_LIST_FILE, "r", encoding="utf-8") as f:
+                # 空行や余計な文字を除去してリストに追加
+                for line in f:
+                    clean_line = line.strip().replace("，", "").replace(",", "")
+                    if clean_line:
+                        full_names.append(clean_line)
+            print(f"✅ Loaded {len(full_names)} names from {NAME_LIST_FILE}")
+        except Exception as e:
+            print(f"⚠️ Error loading {NAME_LIST_FILE}: {e}")
+    else:
+        print(f"ℹ️ {NAME_LIST_FILE} not found. Name conversion will be skipped.")
+            
+    return full_names
+
+def find_best_match(abbrev, name_list):
+    """
+    略称(abbrev) から、リスト内の最も近い正式名称を探す
+    例: "御神訓" -> "御神本訓史"
+    """
+    if not abbrev: return "不明"
+    
+    # 前処理: 空白除去
+    abbrev_clean = abbrev.replace(" ", "").replace("　", "")
+    
+    if not name_list:
+        return abbrev # リストがない場合はそのまま返す
+
+    # 1. 完全一致チェック
+    if abbrev_clean in name_list:
+        return abbrev_clean
+
+    # 2. 自動マッチングロジック (正規表現)
+    # 文字の並び順が一致するものを探す (例: 御.*神.*訓)
+    try:
+        pattern_str = ".*".join(list(abbrev_clean))
+        regex = re.compile(pattern_str)
+    except:
+        return abbrev # 正規表現エラー時はそのまま返す
+
+    candidates = []
+    for fname in name_list:
+        # 条件1: 文字が順番通りに含まれているか？
+        if regex.search(fname):
+            # 条件2: 先頭の文字(苗字の頭)は一致しているか？ (誤検知防止)
+            if fname.startswith(abbrev_clean[0]):
+                candidates.append(fname)
+    
+    # 3. 候補選定
+    if len(candidates) == 1:
+        return candidates[0]
+        
+    elif len(candidates) > 1:
+        # 複数ヒットした場合、最も文字数が短いもの（略称に近いもの）を優先
+        # 例: 「森」で「森泰斗」と「森下」がヒットした場合など
+        return min(candidates, key=len)
+
+    return abbrev # 見つからなければそのまま
 
 # ==================================================
 # 内部ユーティリティ
@@ -275,7 +351,6 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
         info_text = info_td.get_text(" ", strip=True)
         info_text = info_text.replace('\u00a0', ' ').replace('\u3000', ' ')
 
-        # 正規表現: "第 15 回 ... 1 月 12, 13..."
         m = re.search(r'第\s*(\d+)\s*回[^\d]*(\d+)\s*月\s*(.*?)\s*日', info_text)
         if not m:
              return 0, 0, f"開催情報パース不可: {info_text}"
@@ -303,25 +378,16 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
 # 評価抽出ロジック（強化版）
 # ==================================================
 def _parse_grades(text):
-    """
-    Difyの出力テキストから {馬名: 評価} の辞書を作成する。
-    テーブル形式 (| 馬名 | ... | A |) だけでなく、リスト形式なども柔軟に解析。
-    """
     grades = {}
     if not text: return grades
     
-    # 1. テーブル形式 (| ... |) の解析
-    # 行ごとに処理
     for line in text.split('\n'):
         line = line.strip()
         if not line: continue
         
-        # パターンA: パイプ区切りテーブル (| ①馬名 | ... | A |)
         if '|' in line:
             parts = [p.strip() for p in line.split('|') if p.strip()]
-            # 末尾付近に評価(S-E)があるはず
             if len(parts) >= 2:
-                # 後ろから見ていって、最初にS-Eが見つかったらそれを評価とする
                 found_grade = None
                 for p in reversed(parts):
                     if p in ['S','A','B','C','D','E'] or (len(p)==1 and p in 'SABCDE'):
@@ -329,46 +395,29 @@ def _parse_grades(text):
                         break
                 
                 if found_grade:
-                    # 馬名は最初の方にあるはず (馬番などは除去)
                     raw_name = parts[0]
-                    # ①②...や数字、()などを除去して馬名のみにする
                     clean_name = re.sub(r'[①-⑳0-9\(\)（）]', '', raw_name).strip()
-                    # (騎手名)などが残っている場合があるので除去
                     clean_name = clean_name.split('(')[0].strip()
                     if clean_name:
                         grades[clean_name] = found_grade
-                        continue # 次の行へ
-
-    # 2. もしテーブルで取れなかった場合や、補完のために別パターンも探索
-    # 例: "1. 馬名: A" や "①馬名 (A)" など
-    # (今回はテーブル形式が主なので、上記で十分な場合が多いが念のため)
-    
+                        continue
     return grades
 
 def _parse_grades_fuzzy(horse_name, grades):
-    """
-    対戦表の馬名(horse_name)が、Dify評価リスト(grades)にあるか探す。
-    完全一致しなくても、包含関係でヒットさせる。
-    """
-    # 1. 完全一致
     if horse_name in grades:
         return grades[horse_name]
     
-    # 2. 空白除去して一致確認
     h_clean = horse_name.replace(" ", "").replace("　", "")
     for k, v in grades.items():
         k_clean = k.replace(" ", "").replace("　", "")
         if h_clean == k_clean:
             return v
             
-    # 3. 部分一致 (どちらかがどちらかを含んでいる)
     for k, v in grades.items():
-        # Dify側の馬名(k)が、対戦表の馬名(horse_name)に含まれている
-        # またはその逆
         if k in horse_name or horse_name in k:
             return v
             
-    return "" # 見つからない場合は空文字
+    return ""
 
 def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nichi):
     if kai == 0 or nichi == 0:
@@ -490,30 +539,23 @@ def _format_http_error(res: requests.Response) -> str:
         return f"⚠️ Dify HTTP {res.status_code}: {res.text[:800]}"
 
 def run_dify_with_blocking_robust(full_text: str) -> str:
-    """
-    DifyへBlockingモードでリクエスト。
-    タイムアウト600秒で待機。
-    """
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     
     url = _dify_url("/v1/workflows/run")
     payload = {
         "inputs": {"text": full_text},
-        "response_mode": "blocking", # ★Streaming廃止
+        "response_mode": "blocking", 
         "user": "keiba-bot",
     }
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
     sess = get_http_session()
 
-    # 最大3回リトライ
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # タイムアウト600秒 (10分)
             res = sess.post(url, headers=headers, json=payload, timeout=(10, 600))
             
             if res.status_code != 200:
-                # 503/504系ならリトライ
                 if res.status_code in [500, 502, 503, 504]:
                     if attempt < max_retries - 1:
                         time.sleep(10)
@@ -538,6 +580,9 @@ def run_dify_with_blocking_robust(full_text: str) -> str:
 # メイン処理 (Iterator)
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, ui=False):
+    # --- 【初期化】名前リスト読み込み ---
+    name_list = load_name_list()
+    
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
     baba_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
@@ -597,12 +642,23 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 
                 for uma in all_uma:
                     kg = keibago_dict.get(uma, {})
+                    
+                    # --- 名前変換処理 ---
+                    raw_jockey = kg.get('jockey', '')
+                    raw_trainer = kg.get('trainer', '')
+                    
+                    # 統一リストから検索
+                    full_jockey = find_best_match(raw_jockey, name_list)
+                    full_trainer = find_best_match(raw_trainer, name_list)
+                    # --------------------
+
                     prev_info = ""
                     if kg.get('is_change'):
                         pj = kg.get('prev_jockey', '')
-                        prev_info = f" 【⚠️乗り替わり】(前走:{pj})" if pj else " 【⚠️乗り替わり】"
+                        pj_full = find_best_match(pj, name_list) # 前走騎手も変換
+                        prev_info = f" 【⚠️乗り替わり】(前走:{pj_full})" if pj else " 【⚠️乗り替わり】"
 
-                    info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{kg.get('jockey','')}{prev_info} 調教師:{kg.get('trainer','')}"
+                    info = f"▼[馬番{uma}] {kg.get('horse','')} 騎手:{full_jockey}{prev_info} 調教師:{full_trainer}"
                     merged_text.append(f"{info}\n談話: {danwa_dict.get(uma,'なし')}\n調教: {cyokyo_dict.get(uma,'なし')}")
 
                 if not merged_text:
