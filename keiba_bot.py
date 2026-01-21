@@ -46,7 +46,7 @@ def get_http_session() -> requests.Session:
     return sess
 
 def run_dify_prediction(full_text):
-    """ Dify APIにレース情報を送信して予想を取得する """
+    """ Dify APIにレース情報を送信 """
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
@@ -89,6 +89,7 @@ def load_resources():
                 p = str(row[place_col]).strip()
                 j = str(row.get("騎手名", "")).replace(" ","").replace("　","")
                 if p and j:
+                    # 順位や勝率なども含める
                     info = f"騎手パワー:{row.get('騎手パワー','-')}(勝率{row.get('勝率','-')} 複勝率{row.get('複勝率','-')})"
                     res["power"][(p, j)] = info
         except: pass
@@ -103,84 +104,47 @@ def normalize_name(abbrev, full_list):
     return sorted(matches, key=len)[0] if matches else clean
 
 # ==================================================
-# ★開催回・日次 特定ロジック (nankankeiba.com)
+# nankankeiba.com 開催特定
 # ==================================================
-def get_nankan_kai_nichi(year, month, day, place_name):
-    """
-    nankankeiba.comの番組表から、指定日が「第何回・何日目」かを特定する
-    URL: https://www.nankankeiba.com/bangumi_menu/bangumi.do
-    """
+def get_nankan_kai_nichi(month, day, place_name):
+    """ 番組表から第〇回・〇日目を特定 """
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
     sess = get_http_session()
-    
     try:
         res = sess.get(url, timeout=10)
-        res.encoding = 'cp932' # Shift_JIS(CP932)
+        res.encoding = 'cp932'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        target_month = int(month)
-        target_day = int(day)
+        target_m = int(month)
+        target_d = int(day)
         
-        # テーブル行を解析
-        # 行の中に「船橋競馬」などの場所名があり、かつ「第XX回」という記述があるか探す
         for tr in soup.find_all('tr'):
             text = tr.get_text(" ", strip=True)
+            if place_name not in text: continue
             
-            # 場所名チェック (例: "船橋競馬")
-            if place_name not in text:
-                continue
-            
-            # 開催回チェック (例: "第 10 回")
             kai_match = re.search(r'第\s*(\d+)\s*回', text)
-            if not kai_match:
-                continue
-            
+            if not kai_match: continue
             kai = int(kai_match.group(1))
             
+            # 月の特定
+            m_match = re.search(r'(\d+)\s*月', text)
+            if not m_match: continue
+            if int(m_match.group(1)) != target_m: continue
+            
             # 日付リスト抽出
-            # 例: "1月 19, 20, 21, 22, 23日"
-            # 月を特定
-            month_match = re.search(r'(\d+)\s*月', text)
-            if not month_match:
-                continue
-            
-            row_month = int(month_match.group(1))
-            
-            # 月が一致しなければスキップ (月またぎ開催は簡易的に無視するか、必要ならロジック追加)
-            if row_month != target_month:
-                continue
-                
-            # 日付部分を抽出 ("19, 20, 21..." の部分)
-            # "月" の後ろにある数字の列を探す
             days_part = text.split("月")[1]
             days_match = re.findall(r'(\d+)', days_part)
+            days_list = [int(d) for d in days_match if 1 <= int(d) <= 31]
             
-            # 日付リストを作成 (数値)
-            days_list = []
-            for d_str in days_match:
-                d_val = int(d_str)
-                # 明らかにおかしい数字(年度など)を除外するため、1~31の範囲かチェック
-                if 1 <= d_val <= 31:
-                    days_list.append(d_val)
-                # "日" という文字が出てきたらそこで終了してもよいが、findallで全部取る
-            
-            # ターゲット日がリストにあるか
-            if target_day in days_list:
-                # 何日目か (インデックス + 1)
-                nichi = days_list.index(target_day) + 1
-                return kai, nichi
-                
-        return None, None # 見つからなかった場合
-
-    except Exception as e:
-        print(f"Error fetching kai/nichi: {e}")
+            if target_d in days_list:
+                return kai, days_list.index(target_d) + 1
         return None, None
+    except: return None, None
 
 # ==================================================
-# nankankeiba & KeibaBook 解析
+# nankankeiba 詳細解析
 # ==================================================
 def parse_nankankeiba_detail(html, place_name, resources):
-    """ 詳細出走表解析 """
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
 
@@ -281,20 +245,72 @@ def parse_nankankeiba_detail(html, place_name, resources):
         except: continue
     return data
 
-def parse_kb_danwa_cyokyo(driver, kb_rid):
-    """ 競馬ブック解析 """
+# ==================================================
+# 競馬ブック 解析 (修正版)
+# ==================================================
+def get_keibabook_id_robust(driver, year, month, day, nk_place_code):
+    """ 
+    競馬ブックの日程ページから、指定した日付・場所のレースID（先頭12桁）を取得する 
+    nk_place_code: 18(浦和), 19(船橋), 20(大井), 21(川崎)
+    """
+    date_str = f"{year}{month}{day}"
+    # 競馬ブックの日程ページ
+    url = f"https://s.keibabook.co.jp/chihou/nittei/{date_str}10"
+    driver.get(url)
+    
+    # リンクを探す
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"(\d{16})", a["href"])
+        if m:
+            rid = m.group(1)
+            # 場所コードチェック
+            # 南関のコードは 18~21 なので、それがIDの9,10桁目に含まれているか確認
+            # KeibaBook ID: YYYYMMDD(8) + Place(2) + Race(2) + 00(2) + ...?
+            # 実際には YYYYMMDDppRR00 という構成が多い。ppが場所。
+            
+            # マッピング補正: KeibaBookのURL ID内の場所コード
+            # 10:大井, 11:川崎, 12:船橋, 13:浦和 (これはユーザー定義の入力コードと同じ)
+            # nankankeiba: 20:大井, 21:川崎, 19:船橋, 18:浦和
+            
+            # ここではシンプルに、ユーザー入力の nk_place_code に対応する KeibaBookのID桁を探す
+            # nk_place_code -> KB internal code map
+            nk_to_kb_id_map = {"20":"10", "21":"11", "19":"12", "18":"13"}
+            target_kb_code = nk_to_kb_id_map.get(nk_place_code)
+            
+            # IDの9,10桁目が target_kb_code か確認
+            if rid[8:10] == target_kb_code:
+                # 該当レースIDの先頭10桁 (YYYYMMDDpp) を返す
+                return rid[:10]
+    
+    return None
+
+def parse_kb_danwa_cyokyo(driver, kb_base_id, race_num):
+    """ 
+    競馬ブックから談話・調教を取得 
+    kb_base_id: YYYYMMDDpp (10桁)
+    """
+    kb_rid = f"{kb_base_id}{str(race_num).zfill(2)}00" # 末尾00付与
     d_danwa, d_cyokyo = {}, {}
+    
     try:
+        # 談話
         driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_rid}")
+        if "login" in driver.current_url: # ログアウトしてたら再ログイン
+            login_keibabook_robust(driver)
+            driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_rid}")
+
         soup = BeautifulSoup(driver.page_source, "html.parser")
         tbl = soup.find("table", class_="danwa")
         if tbl and tbl.tbody:
+            cur = None
             for row in tbl.tbody.find_all("tr"):
                 u = row.find("td", class_="umaban")
-                if u:
-                    t = row.find("td", class_="danwa")
-                    if t: d_danwa[u.get_text(strip=True)] = t.get_text(strip=True)
+                if u: cur = u.get_text(strip=True); continue
+                t = row.find("td", class_="danwa")
+                if t and cur: d_danwa[cur] = t.get_text(strip=True); cur=None
         
+        # 調教
         driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_rid}")
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tbl in soup.find_all("table", class_="cyokyo"):
@@ -304,10 +320,21 @@ def parse_kb_danwa_cyokyo(driver, kb_rid):
                     if u:
                         tp = row.find("td", class_="tanpyo")
                         tp_txt = tp.get_text(strip=True) if tp else ""
-                        dt_txt = row.find_next_sibling("tr").get_text(" ", strip=True)
+                        sib = row.find_next_sibling("tr")
+                        dt_txt = sib.get_text(" ", strip=True) if sib else ""
                         d_cyokyo[u.get_text(strip=True)] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
-    except: pass
+    except Exception as e:
+        print(f"KB Parse Error: {e}")
+        pass
     return d_danwa, d_cyokyo
+
+def login_keibabook_robust(driver):
+    driver.get("https://s.keibabook.co.jp/login/login")
+    try:
+        WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
+        driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
+        driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
+    except: pass
 
 # ==================================================
 # 対戦表 & 評価解析
@@ -324,7 +351,6 @@ def _parse_grades_from_ai(text):
     return grades
 
 def _fetch_matchup_table(nankan_id, grades):
-    """ AI評価付き対戦表生成 """
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
     sess = get_http_session()
     try:
@@ -404,11 +430,14 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
     # 1. 準備
     resources = load_resources()
     
-    kb_place_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
-    nk_place_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
+    # ユーザー入力コード(KB準拠)からNankanコードへ変換
+    # ユーザー入力: 10:大井, 11:川崎, 12:船橋, 13:浦和
+    # Nankan: 20:大井, 21:川崎, 19:船橋, 18:浦和
+    kb_input_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
+    nk_code_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
     
-    place_name = kb_place_map.get(place_code, "地方")
-    nk_place_code = nk_place_map.get(place_code)
+    place_name = kb_input_map.get(place_code, "地方")
+    nk_place_code = nk_code_map.get(place_code)
 
     if not nk_place_code: yield (0, "⚠️ 場所コードエラー"); return
 
@@ -421,61 +450,51 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
 
     try:
         # 2. 開催情報特定 (Kai, Nichi)
-        if ui: st.info("📅 開催回・日次を特定中...")
-        kai, nichi = get_nankan_kai_nichi(year, month, day, place_name)
+        if ui: st.info("📅 開催回・日次を特定中(nankankeiba)...")
+        kai, nichi = get_nankan_kai_nichi(month, day, place_name)
         if not kai or not nichi:
             yield (0, f"⚠️ 開催情報が見つかりませんでした (日付: {month}/{day} {place_name})")
             return
-        
         if ui: st.success(f"✅ {place_name} 第{kai}回 {nichi}日目")
 
         # 3. ログイン (KeibaBook)
-        driver.get("https://s.keibabook.co.jp/login/login")
-        if "logout" not in driver.current_url:
-            wait.until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
-            driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
-            driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
-            time.sleep(1)
+        if ui: st.info("🔑 ログイン中(KeibaBook)...")
+        login_keibabook_robust(driver)
 
-        # 4. レースIDリスト作成
-        # nankankeibaのプログラムID: YYYYMMDD + Place(2) + Race(2)  (詳細IDにはKai/Nichiが入る)
-        # 詳細URL: YYYYMMDD + Place(2) + Kai(2) + Nichi(2) + Race(2)
-        # 既にKai/Nichiが分かっているので、ループでIDを生成できる
+        # 4. KeibaBook IDベースの特定
+        kb_base_id = get_keibabook_id_robust(driver, year, month, day, nk_place_code)
+        if not kb_base_id:
+            if ui: st.warning("⚠️ 競馬ブックの日程が見つかりません。談話・調教はスキップされます。")
         
-        # ただし、実際に何レースまであるか確認するため、プログラムページを見るのが安全
+        # 5. レース一覧取得 (nankankeibaプログラムページ)
         prog_url = f"https://www.nankankeiba.com/program/{year}{month}{day}{nk_place_code}.do"
         driver.get(prog_url)
         soup_prog = BeautifulSoup(driver.page_source, "html.parser")
         
         race_nums = []
         for a in soup_prog.find_all("a", href=True):
-            # .../2026012119100301.do のようなリンクを探す
             if f"{year}{month}{day}{nk_place_code}" in a["href"] and "uma_shosai" not in a["href"]:
                 fname = a["href"].split("/")[-1].replace(".do","")
-                if len(fname) == 16:
-                    race_nums.append(int(fname[14:16]))
+                if len(fname) == 16: race_nums.append(int(fname[14:16]))
         
         race_nums = sorted(list(set(race_nums)))
-        if not race_nums:
-            # 取得できなかった場合はデフォルトで12Rまで回す
-            race_nums = range(1, 13)
+        if not race_nums: race_nums = range(1, 13) # fallback
 
-        # 5. 各レース処理
+        # 6. 各レース処理
         for r_num in race_nums:
             if target_races and r_num not in target_races: continue
             
             if ui: st.markdown(f"## {place_name} {r_num}R")
             
             try:
-                # A. ID生成
-                # nankankeiba詳細ID (16桁) = YYYYMMDD(8) + Place(2) + Kai(2) + Nichi(2) + Race(2)
+                # A. データ取得
+                # KeibaBook (KB IDが見つかっていれば)
+                danwa, cyokyo = {}, {}
+                if kb_base_id:
+                    danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_base_id, r_num)
+                
+                # Nankan
                 nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
-                # KeibaBook ID = YYYYMMDD + KB_Place + RR
-                kb_id = f"{year}{month}{day}{place_code}{r_num:02}"
-                
-                # B. データ取得
-                danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
-                
                 nk_url = f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do"
                 driver.get(nk_url)
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
@@ -483,7 +502,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 if not nk_data["horses"]:
                     yield (r_num, f"⚠️ データ取得失敗: {nk_url}"); continue
 
-                # C. プロンプト作成
+                # B. プロンプト作成
                 header = f"レース名: {r_num}R {nk_data['meta'].get('race_name','')}　格付け:{nk_data['meta'].get('grade','')}　コース:{nk_data['meta'].get('course','')}"
                 horse_texts = []
                 for u in sorted(nk_data["horses"].keys(), key=int):
@@ -508,15 +527,15 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
                 
-                # D. Dify送信
+                # C. Dify送信
                 if ui: st.info("🤖 AI分析中...")
                 ai_output = run_dify_prediction(full_prompt)
                 
-                # E. 対戦表作成
+                # D. 対戦表作成
                 grades = _parse_grades_from_ai(ai_output)
                 matchup_text = _fetch_matchup_table(nk_id, grades)
                 
-                # F. 最終出力
+                # E. 最終出力
                 final_res = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_output}\n\n{matchup_text}\n\n=== 📊分析データ(抜粋) ===\n{full_prompt[:300]}..."
                 
                 if ui: st.success("✅ 完了")
