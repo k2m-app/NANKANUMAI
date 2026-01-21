@@ -39,6 +39,10 @@ DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 @st.cache_resource
 def get_http_session() -> requests.Session:
     sess = requests.Session()
+    # 競馬ブックなどはスマホサイトへアクセスするためUAを偽装
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    })
     retry = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("https://", adapter)
@@ -46,14 +50,22 @@ def get_http_session() -> requests.Session:
     return sess
 
 def run_dify_prediction(full_text):
+    """ Dify APIにレース情報を送信して予想を取得する """
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
+    
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
-    payload = {"inputs": {"text": full_text}, "response_mode": "blocking", "user": "keiba-bot"}
+    payload = {
+        "inputs": {"text": full_text}, 
+        "response_mode": "blocking", 
+        "user": "keiba-bot"
+    }
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
+    
     sess = get_http_session()
     try:
-        res = sess.post(url, headers=headers, json=payload, timeout=90)
-        if res.status_code != 200: return f"⚠️ Dify Error: {res.status_code}"
+        # 推論には時間がかかるためタイムアウトを長めに
+        res = sess.post(url, headers=headers, json=payload, timeout=120)
+        if res.status_code != 200: return f"⚠️ Dify Error: {res.status_code} {res.text}"
         j = res.json()
         return j.get("data", {}).get("outputs", {}).get("text", "") or str(j)
     except Exception as e: return f"⚠️ API Error: {e}"
@@ -64,16 +76,22 @@ def run_dify_prediction(full_text):
 @st.cache_resource
 def load_resources():
     res = {"jockeys": [], "trainers": [], "power": {}}
+    
+    # 騎手リスト
     if os.path.exists(JOCKEY_FILE):
         try:
             with open(JOCKEY_FILE, "r", encoding="utf-8-sig") as f:
                 res["jockeys"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
         except: pass
+    
+    # 調教師リスト
     if os.path.exists(TRAINER_FILE):
         try:
             with open(TRAINER_FILE, "r", encoding="utf-8-sig") as f:
                 res["trainers"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
         except: pass
+    
+    # 騎手パワー
     if os.path.exists(POWER_FILE):
         try:
             df = pd.read_csv(POWER_FILE, encoding="utf-8-sig")
@@ -88,19 +106,21 @@ def load_resources():
     return res
 
 def normalize_name(abbrev, full_list):
+    """ 名寄せロジック """
     if not abbrev: return ""
     clean = abbrev.replace(" ","").replace("　","")
     if not full_list: return clean
     if clean in full_list: return clean
+    # 前方一致で候補を探す (例: 木間龍 -> 木間塚龍馬)
     matches = [n for n in full_list if n.startswith(clean) or (len(clean)>=2 and n.startswith(clean[0]) and clean[1] in n)]
     return sorted(matches, key=len)[0] if matches else clean
 
 # ==================================================
-# 開催回・日次 特定ロジック (nankankeiba番組表)
+# 開催回・日次 特定ロジック (nankankeiba)
 # ==================================================
 def get_nankan_kai_nichi(month, day, place_name):
     """ 
-    nankankeibaの番組表から「第〇回・〇日目」を特定 
+    nankankeibaの番組表から「第〇回・〇日目」を特定
     ※この「〇日目(nichi)」は競馬ブックのURL生成にも使用します
     """
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
@@ -117,74 +137,124 @@ def get_nankan_kai_nichi(month, day, place_name):
             text = tr.get_text(" ", strip=True)
             if place_name not in text: continue
             
+            # 回数の特定
             kai_match = re.search(r'第\s*(\d+)\s*回', text)
             if not kai_match: continue
             kai = int(kai_match.group(1))
             
+            # 月の特定
             m_match = re.search(r'(\d+)\s*月', text)
             if not m_match: continue
             if int(m_match.group(1)) != target_m: continue
             
             # 日付リスト抽出 (例: 19, 20, 21...)
-            days_part = text.split("月")[1]
-            days_match = re.findall(r'(\d+)', days_part)
-            days_list = [int(d) for d in days_match if 1 <= int(d) <= 31]
-            
-            if target_d in days_list:
-                nichi = days_list.index(target_d) + 1
-                return kai, nichi
+            if "月" in text:
+                days_part = text.split("月")[1]
+                days_match = re.findall(r'(\d+)', days_part)
+                # 妥当な日付のみリスト化
+                days_list = [int(d) for d in days_match if 1 <= int(d) <= 31]
+                
+                if target_d in days_list:
+                    nichi = days_list.index(target_d) + 1
+                    return kai, nichi
         return None, None
     except: return None, None
 
 # ==================================================
-# データ取得 & 解析
+# 競馬ブック 解析ロジック (URL計算・HTML解析)
 # ==================================================
-def login_keibabook_robust(driver):
-    driver.get("https://s.keibabook.co.jp/login/login")
-    try:
-        WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
-        driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
-        driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
-    except: pass
+def get_kb_url_id(year, month, day, place_code, nichi, race_num):
+    """
+    競馬ブックのURL IDを計算で生成
+    Format: YYYY(4) + MM(2) + Place(2) + Nichi(2) + Race(2) + MMDD(4)
+    """
+    mm = str(month).zfill(2)
+    dd = str(day).zfill(2)
+    p_code = str(place_code).zfill(2)
+    n_code = str(nichi).zfill(2)
+    r_code = str(race_num).zfill(2)
+    
+    return f"{year}{mm}{p_code}{n_code}{r_code}{mm}{dd}"
 
 def parse_kb_danwa_cyokyo(driver, kb_id):
     """ 
     競馬ブックから談話・調教を取得 
-    URL: https://s.keibabook.co.jp/chihou/danwa/1/[KB_ID]
     """
     d_danwa, d_cyokyo = {}, {}
-    try:
-        # 談話取得
-        driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
+    
+    # ログイン状態維持のためのリトライ
+    def ensure_login():
         if "login" in driver.current_url:
-            login_keibabook_robust(driver)
-            driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
+            try:
+                driver.find_element(By.NAME, "login_id").send_keys(KEIBA_ID)
+                driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
+                driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
+                time.sleep(1)
+            except: pass
 
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        tbl = soup.find("table", class_="danwa")
-        if tbl and tbl.tbody:
-            for row in tbl.tbody.find_all("tr"):
-                u = row.find("td", class_="umaban")
-                if u:
-                    t = row.find("td", class_="danwa")
-                    if t: d_danwa[u.get_text(strip=True)] = t.get_text(strip=True)
+    try:
+        # --- 談話 (Danwa) ---
+        url_danwa = f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}"
+        driver.get(url_danwa)
+        ensure_login() # リダイレクト対応
         
-        # 調教取得
-        driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        for tbl in soup.find_all("table", class_="cyokyo"):
-            if tbl.tbody:
-                for row in tbl.tbody.find_all("tr", recursive=False):
-                    u = row.find("td", class_="umaban")
-                    if u:
-                        tp = row.find("td", class_="tanpyo")
-                        tp_txt = tp.get_text(strip=True) if tp else ""
-                        sib = row.find_next_sibling("tr")
-                        dt_txt = sib.get_text(" ", strip=True) if sib else ""
-                        d_cyokyo[u.get_text(strip=True)] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
-    except: pass
+        # table class="default danwa" を探す
+        for tbl in soup.select("table.danwa"):
+            current_horse = None
+            for tr in tbl.select("tbody tr"):
+                # 馬番行
+                u_td = tr.select_one("td.umaban")
+                if u_td:
+                    current_horse = u_td.get_text(strip=True)
+                    continue
+                
+                # 談話行
+                t_td = tr.select_one("td.danwa")
+                if current_horse and t_td:
+                    # <p>タグ内のテキストを取得
+                    text = t_td.get_text(strip=True)
+                    d_danwa[current_horse] = text
+                    current_horse = None # リセット
+
+        # --- 調教 (Cyokyo) ---
+        url_cyokyo = f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}"
+        driver.get(url_cyokyo)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        
+        # 複数の table class="default cyokyo" がある
+        for tbl in soup.select("table.cyokyo"):
+            rows = tbl.select("tbody tr")
+            if not rows: continue
+            
+            # 1行目: 基本情報
+            r1 = rows[0]
+            u_td = r1.select_one("td.umaban")
+            if not u_td: continue
+            
+            uma_num = u_td.get_text(strip=True)
+            tanpyo = ""
+            tp_td = r1.select_one("td.tanpyo")
+            if tp_td: tanpyo = tp_td.get_text(strip=True)
+            
+            # 2行目以降: 詳細 (dlやnested table)
+            detail_text = ""
+            if len(rows) > 1:
+                # 2行目のテキストをまるごと取得して整形
+                raw_text = rows[1].get_text(" ", strip=True)
+                # 連続する空白を1つに
+                detail_text = re.sub(r'\s+', ' ', raw_text)
+            
+            d_cyokyo[uma_num] = f"【短評】{tanpyo} 【詳細】{detail_text}"
+
+    except Exception as e:
+        print(f"KB Parse Error: {e}")
+        
     return d_danwa, d_cyokyo
 
+# ==================================================
+# nankankeiba 詳細解析
+# ==================================================
 def parse_nankankeiba_detail(html, place_name, resources):
     """ nankankeiba詳細出走表解析 """
     soup = BeautifulSoup(html, "html.parser")
@@ -223,6 +293,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             t_full = normalize_name(t_raw, resources["trainers"])
             power = resources["power"].get((place_name, j_full), "騎手パワー:不明")
 
+            # 相性データ
             ai2 = row.select_one("td.cs-ai2 .graph_text_div")
             pair_stats = "データなし"
             if ai2 and "データ" not in ai2.get_text():
@@ -231,13 +302,15 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 t = ai2.select_one(".is-total").get_text(strip=True)
                 pair_stats = f"勝率{r}({w}勝/{t}回)"
 
+            # 近走3走
             history = []
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z or not z.get_text(strip=True): continue
                 
-                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
+                # 日付・場所
                 d_txt = ""
+                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
                 if d_spans:
                     for s in d_spans:
                         if re.search(r"\d+\.\d+\.\d+", s.get_text()): d_txt = s.get_text(strip=True); break
@@ -387,15 +460,18 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
 
     if not nk_place_code: yield (0, "⚠️ 場所コードエラー"); return
 
+    # スマホエミュレーション用オプション (Selenium)
     ops = Options()
     ops.add_argument("--headless=new")
     ops.add_argument("--no-sandbox")
     ops.add_argument("--disable-dev-shm-usage")
+    ops.add_argument("user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+    
     driver = webdriver.Chrome(options=ops)
     wait = WebDriverWait(driver, 10)
 
     try:
-        # 1. 開催回・日次特定 (nankankeiba)
+        # 1. 開催情報特定 (Kai, Nichi)
         if ui: st.info("📅 開催情報を特定中...")
         kai, nichi = get_nankan_kai_nichi(month, day, place_name)
         if not kai or not nichi:
@@ -405,7 +481,7 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
         if ui: st.success(f"✅ {place_name} 第{kai}回 {nichi}日目")
 
         # 2. ログイン (KeibaBook)
-        if ui: st.info("🔑 ログイン中...")
+        if ui: st.info("🔑 ログイン中(KeibaBook)...")
         login_keibabook_robust(driver)
 
         # 3. レース一覧取得 (nankankeiba)
@@ -429,13 +505,11 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
             if ui: st.markdown(f"## {place_name} {r_num}R")
             
             try:
-                # ★ID生成 (ユーザー様提供の法則に基づく)
-                # nankankeiba: YYYYMMDD + Place(2) + Kai(2) + Nichi(2) + Race(2)
+                # ★ID生成
                 nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
-                
-                # KeibaBook: YYYY(4) + MM(2) + Place(2) + Nichi(2) + Race(2) + MMDD(4)
-                # ※ユーザー様分析: 1-4年, 5-6月, 7-8場, 9-10日次, 11-12R, 13-16月日
-                kb_id = f"{year}{month}{place_code}{nichi:02}{r_num:02}{month}{day}"
+                # KB_ID: YYYY(4)+MM(2)+Place(2)+Nichi(2)+R(2)+MMDD(4)
+                # place_codeはユーザー入力のまま(10,11,12,13)
+                kb_id = get_kb_url_id(year, month, day, place_code, nichi, r_num)
                 
                 # A. データ取得
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
