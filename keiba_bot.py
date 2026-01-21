@@ -63,20 +63,19 @@ def run_dify_prediction(full_text):
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
     
-    # テキストが長すぎる場合は警告
-    if len(full_text) > 15000:
-        print(f"⚠️ Prompt too long: {len(full_text)} chars")
+    # 文字数警告
+    if len(full_text) > 12000:
+        print(f"⚠️ Text too long ({len(full_text)} chars). Reducing history...")
     
     payload = {"inputs": {"text": full_text}, "response_mode": "blocking", "user": "keiba-bot"}
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
     sess = get_http_session()
     
     try:
-        # タイムアウトを120秒に設定
-        res = sess.post(url, headers=headers, json=payload, timeout=120)
+        # タイムアウトを180秒に延長
+        res = sess.post(url, headers=headers, json=payload, timeout=180)
         
         if res.status_code != 200:
-            # 504エラー等の場合はhtmlが返ってくることがあるため、先頭200文字だけ表示
             err_msg = res.text[:200]
             return f"⚠️ Dify Error ({res.status_code}): {err_msg}..."
             
@@ -111,10 +110,10 @@ def load_resources():
                 p = str(row[place_col]).strip()
                 j = str(row.get("騎手名", "")).replace(" ","").replace("　","")
                 if p and j:
-                    power_val = row.get('騎手力','-')
+                    power_val = row.get('騎手パワー','-')
                     win = row.get('勝率','-')
                     fuku = row.get('複勝率','-')
-                    info = f"P:{power_val}(勝{win} 複{fuku})" # 少し短縮
+                    info = f"P:{power_val}(勝{win} 複{fuku})" 
                     key = (p, j)
                     res["power"][key] = info
                     res["power_data"][key] = {"power": power_val, "win": win, "fuku": fuku}
@@ -172,6 +171,7 @@ def get_kb_url_id(year, month, day, place_code, nichi, race_num):
 def parse_kb_danwa_cyokyo(driver, kb_id):
     d_danwa, d_cyokyo = {}, {}
     try:
+        # --- 談話 (軽量化処理) ---
         driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
         if "login" in driver.current_url:
             login_keibabook_robust(driver)
@@ -185,11 +185,18 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                 if u: curr = u.get_text(strip=True); continue
                 t = tr.select_one("td.danwa")
                 if curr and t: 
-                    # 談話は長くなりがちなので、改行などを詰める
-                    raw = t.get_text(" ", strip=True)
-                    d_danwa[curr] = re.sub(r'\s+', ' ', raw)
+                    raw_text = t.get_text(" ", strip=True)
+                    # ★修正: ダッシュ(―)より後ろの本文のみを抽出して軽量化
+                    # 例: "○馬名(短評) 師名――本文" -> "本文"
+                    m = re.search(r'[―-]+(.*)', raw_text)
+                    if m:
+                        clean_text = m.group(1).strip()
+                        d_danwa[curr] = clean_text
+                    else:
+                        d_danwa[curr] = raw_text # マッチしなければそのまま
                     curr = None
 
+        # --- 調教 ---
         driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tbl in soup.select("table.cyokyo"):
@@ -200,7 +207,13 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
             if not u_td: continue
             uma = u_td.get_text(strip=True)
             tp_txt = r1.select_one("td.tanpyo").get_text(strip=True) if r1.select_one("td.tanpyo") else ""
-            dt_txt = re.sub(r'\s+', ' ', rows[1].get_text(" ", strip=True)) if len(rows)>1 else ""
+            
+            # 詳細（タイム等）は連続する空白を削除して圧縮
+            dt_txt = ""
+            if len(rows) > 1:
+                dt_raw = rows[1].get_text(" ", strip=True)
+                dt_txt = re.sub(r'\s+', ' ', dt_raw)
+                
             d_cyokyo[uma] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
     except: pass
     return d_danwa, d_cyokyo
@@ -228,8 +241,20 @@ def parse_nankankeiba_detail(html, place_name, resources):
             umaban = u_tag.get_text(strip=True)
             if not umaban.isdigit(): continue
             
-            horse_tag = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
-            horse_name = horse_tag.get_text(strip=True) if horse_tag else row.select_one("td.is-col03").get_text(strip=True)
+            # ★馬名を確実に取得（複数のセレクタを試行）
+            horse_name = "不明"
+            # 1. リンク付き馬名
+            h_link = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
+            if h_link:
+                horse_name = h_link.get_text(strip=True)
+            else:
+                # 2. テキストのみの場合（リンクなし）
+                # nk23_u-text16クラスを持つspanなどを探す
+                td3 = row.select_one("td.is-col03")
+                if td3:
+                    nm_span = td3.select_one(".nk23_u-text16")
+                    if nm_span: horse_name = nm_span.get_text(strip=True)
+                    else: horse_name = td3.get_text(strip=True).split()[0] # 最初の塊を取得
 
             jg_td = row.select_one("td.cs-g1")
             j_raw, t_raw = "", ""
@@ -251,6 +276,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
 
             history = []
+            prev_power_info = ""
+
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z or not z.get_text(strip=True): continue
@@ -261,13 +288,12 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     for s in d_spans:
                         if re.search(r"\d+\.\d+\.\d+", s.get_text()): d_txt = s.get_text(strip=True); break
                 
-                ymd_short = ""
-                place_short = ""
+                ymd, place_short = "", ""
                 m = re.match(r"([^\d]+)(\d+)\.(\d+)\.(\d+)", d_txt)
                 if m:
                     place_short = m.group(1)
-                    # "26.1.7" -> "26/1/7" に短縮
-                    ymd_short = f"{m.group(2)}/{m.group(3)}/{m.group(4)}"
+                    # 年月日を短縮 (26/1/7)
+                    ymd = f"{m.group(2)}/{m.group(3)}/{m.group(4)}"
                 
                 cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
                 dist_m = re.search(r"\d{4}", cond_txt)
@@ -277,8 +303,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 r_a = z.select_one("a.is-link")
                 r_ti = r_a.get("title", "") if r_a else ""
                 rp = re.split(r'[ 　]+', r_ti)
-                # レース名は長いので先頭6文字にカット
-                r_nm = rp[0][:6] if rp else ""
+                # ★修正: レース名は削除して軽量化
                 r_cl = rp[1] if len(rp)>1 else ""
 
                 p_lines = z.select("p.nk23_u-text10")
@@ -301,22 +326,21 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 
-                # ★前回騎手力取得
-                prev_power_info = ""
+                # 前回騎手パワー
                 if i == 1:
                     p_data = resources["power_data"].get((place_short, j_prev_full))
                     if p_data: prev_power_info = f"前P:{p_data['power']}"
 
-                # プロンプト圧縮のため情報を詰め込む
-                # 例: [近1] 26/1/7 浦和1400 初夢特別 B2B3 小杉亮 7-6-7-11(3F10位)→10着(9人)
-                h_str = f"{ymd_short} {course_s} {r_nm} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
+                # ★修正: レース名を除去した短縮フォーマット
+                # 例: 26/1/7 浦和1400 B3 小杉亮 7-6-7-11(3F10位)→10着(9人)
+                h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
 
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
                 "power": power_info, "prev_power": prev_power_info,
                 "compat": pair_stats, "hist": history, 
-                "prev_jockey_name": history[0].split(" ")[4] if history else "" # 簡易抽出
+                "prev_jockey_name": history[0].split(" ")[3] if history else "" # 騎手位置調整
             }
         except Exception: continue
     return data
