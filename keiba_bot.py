@@ -526,10 +526,22 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 if ui: st.info("🤖 AI分析中...")
                 ai_out = run_dify_prediction(full_prompt)
                 
+                # (前略)
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table(nk_id, grades)
-                
-                final = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out}\n\n{match_txt}\n\n=== 📊分析データ(抜粋) ===\n{full_prompt[:400]}..."
+
+                # ▼▼▼ 修正箇所ここから ▼▼▼
+
+                # 1. AI出力(ai_out)から、ハイフンだけの行（区切り線）を削除する処理
+                # ※テーブルの構造（|---|）は消さずに、単独の区切り線（------）だけを消します
+                ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
+                # 空行が続きすぎるのを防ぐ（3つ以上の改行を2つにする）
+                ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
+
+                # 2. 「=== 📊分析データ(抜粋) ===」を含めずに final を作成
+                final = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
+
+                # ▲▲▲ 修正箇所ここまで ▲▲▲
                 
                 if ui: st.success("✅ 完了")
                 yield (r_num, final)
