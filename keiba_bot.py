@@ -17,9 +17,11 @@ from urllib3.util.retry import Retry
 
 # ==================================================
 # 【設定】ファイルパス設定
+# ※フォルダ階層がある場合は適宜 "data/2025_NARJockey.csv" 等に変更してください
 # ==================================================
-NAME_LIST_FILE = "NAR.csv"          # 騎手・調教師名リスト
-STATS_FILE = "騎手調教師_2025.csv"  # 相性データCSV
+JOCKEY_FILE = "2025data/2025_NARJockey.csv"        # 騎手名リスト
+TRAINER_FILE = "2025data/2025_NankanTrainer.csv"   # 調教師名リスト
+STATS_FILE = "2025data/騎手調教師_2025.csv"        # 相性データCSV
 
 # ==================================================
 # 【設定】Secrets読み込み
@@ -30,62 +32,76 @@ DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 # ==================================================
-# ★名前＆相性データ読み込みロジック（完全修正版）
+# ★名前＆相性データ読み込みロジック（分離・完全修正版）
 # ==================================================
 @st.cache_resource
 def load_data_resources():
     """
-    名前リストと相性データをメモリに読み込む
+    騎手リスト、調教師リスト、相性データをメモリに読み込む
     Professional Fix: 
-    - 内部の空白(全角/半角)を全て除去してキーにする「完全正規化」を導入
-    - utf-8-sig対応でBOM問題を解決
-    - ヘッダーの空白除去でKeyErrorを防止
+    - 騎手と調教師を別々のリストとして管理
+    - 内部の空白(全角/半角)を全て除去してキーにする「完全正規化」
+    - utf-8-sig対応
     """
-    resources = {"names": [], "stats": {}}
+    resources = {"jockeys": [], "trainers": [], "stats": {}}
     
     # -------------------------------------------------
-    # 1. 名前リスト (NAR.csv)
+    # 1. 騎手リスト (2025_NARJockey.csv)
     # -------------------------------------------------
-    if os.path.exists(NAME_LIST_FILE):
+    if os.path.exists(JOCKEY_FILE):
         try:
-            with open(NAME_LIST_FILE, "r", encoding="utf-8-sig") as f:
+            with open(JOCKEY_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     # カンマ、スペースを除去してリスト化
-                    clean_line = line.strip().replace("，", "").replace(",", "")
+                    clean_line = line.strip().replace("，", "").replace(",", "").replace("　", "").replace(" ", "")
                     if clean_line:
-                        resources["names"].append(clean_line)
-            print(f"✅ Names loaded: {len(resources['names'])}")
+                        resources["jockeys"].append(clean_line)
+            print(f"✅ Jockeys loaded: {len(resources['jockeys'])}")
         except Exception as e:
-            print(f"⚠️ Names loading error: {e}")
+            print(f"⚠️ Jockey list loading error: {e}")
     else:
-        print(f"ℹ️ {NAME_LIST_FILE} not found. Skipping name normalization.")
+        print(f"ℹ️ {JOCKEY_FILE} not found. Skipping jockey normalization.")
 
     # -------------------------------------------------
-    # 2. 相性データ (騎手調教師_2025.csv)
+    # 2. 調教師リスト (2025_NankanTrainer.csv)
+    # -------------------------------------------------
+    if os.path.exists(TRAINER_FILE):
+        try:
+            with open(TRAINER_FILE, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    # カンマ、スペースを除去してリスト化
+                    clean_line = line.strip().replace("，", "").replace(",", "").replace("　", "").replace(" ", "")
+                    if clean_line:
+                        resources["trainers"].append(clean_line)
+            print(f"✅ Trainers loaded: {len(resources['trainers'])}")
+        except Exception as e:
+            print(f"⚠️ Trainer list loading error: {e}")
+    else:
+        print(f"ℹ️ {TRAINER_FILE} not found. Skipping trainer normalization.")
+
+    # -------------------------------------------------
+    # 3. 相性データ (騎手調教師_2025.csv)
     # -------------------------------------------------
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 
-                # 【重要】ヘッダーのクリーニング（余分な空白を削除）
-                # ' 騎手名 ' -> '騎手名' のように修正
+                # 【重要】ヘッダーのクリーニング
                 if reader.fieldnames:
                     reader.fieldnames = [h.strip().replace(' ', '').replace('　', '') for h in reader.fieldnames]
 
                 count = 0
                 for row in reader:
-                    # 【重要】値の取得時に内部の空白もすべて削除してキーにする
+                    # 値の取得時に内部の空白もすべて削除してキーにする
                     raw_jockey = row.get('騎手名', '')
                     raw_trainer = row.get('調教師名', '')
                     
-                    # 検索用キー（スペースなし）を作成
                     jockey_key = raw_jockey.replace(" ", "").replace("　", "")
                     trainer_key = raw_trainer.replace(" ", "").replace("　", "")
                     
                     if not jockey_key or not trainer_key: continue
                     
-                    # 数値データの取得と計算
                     try:
                         total = int(row.get('出走回数', 0) or 0)
                         w1 = int(row.get('1着', 0) or 0)
@@ -97,15 +113,12 @@ def load_data_resources():
                         fuku_rate = row.get('複勝率', '0%').strip()
                         
                         record_str = f"{w1}-{w2}-{w3}-{others}"
-                        
-                        # 検索キーをタプルで作成
                         key = (jockey_key, trainer_key)
                         
-                        # データ格納
                         resources["stats"][key] = f"【相性】勝率:{win_rate} 複勝率:{fuku_rate} ({record_str})"
                         count += 1
                     except ValueError:
-                        continue # 数値変換エラーの行はスキップ
+                        continue 
                         
             print(f"✅ Stats loaded: {count} pairs (Normalized keys)")
         except Exception as e:
@@ -116,7 +129,10 @@ def load_data_resources():
     return resources
 
 def find_best_match(abbrev, name_list):
-    """ 略称 -> 正式名称への変換ロジック """
+    """ 
+    略称 -> 正式名称への変換ロジック 
+    name_list: 騎手リストまたは調教師リストの特定リストを渡す
+    """
     if not abbrev: return "不明"
     abbrev_clean = abbrev.replace(" ", "").replace("　", "")
     if not name_list: return abbrev
@@ -134,7 +150,7 @@ def find_best_match(abbrev, name_list):
 
     candidates = []
     for fname in name_list:
-        # 文字順序が一致 かつ 先頭文字（苗字）が一致するもの
+        # 文字順序が一致 かつ 先頭文字（苗字の頭）が一致するもの
         if regex.search(fname) and fname.startswith(abbrev_clean[0]):
             candidates.append(fname)
     
@@ -142,6 +158,7 @@ def find_best_match(abbrev, name_list):
         return candidates[0]
     elif len(candidates) > 1:
         # 複数候補がある場合は最も短い名前（略称に近い）を採用
+        # 例: 「森」で「森泰斗」と「森下」がヒットした場合など（文脈によるが短い方を優先）
         return min(candidates, key=len)
     
     return abbrev
@@ -149,12 +166,9 @@ def find_best_match(abbrev, name_list):
 def get_compatibility(jockey, trainer, stats_db):
     """ 
     騎手と調教師のペアから相性データを取得 
-    入力された名前からもスペースを排除して照合する
     """
     if not jockey or not trainer: return "(データ不足)"
     
-    # 【重要】検索時もキーを完全正規化（スペース除去）する
-    # これにより "笹川 翼" と "笹川翼" を同一視させる
     j_key = jockey.replace(" ", "").replace("　", "")
     t_key = trainer.replace(" ", "").replace("　", "")
     
@@ -180,7 +194,6 @@ def _ui_markdown(ui, msg):
 @st.cache_resource
 def get_http_session() -> requests.Session:
     sess = requests.Session()
-    # リトライ戦略の強化
     retry = Retry(
         total=3, 
         backoff_factor=0.6, 
@@ -201,7 +214,6 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1400,2200")
-    # 不要なログを抑制
     options.add_argument("--log-level=3")
     return webdriver.Chrome(options=options)
 
@@ -320,7 +332,6 @@ def fetch_keibago_debatable_small(year, month, day, race_no, baba_code):
     title_span = soup.select_one("span.midium")
     if title_span: nar_race_level = title_span.get_text(strip=True)
     
-    # セレクタの堅牢化
     main_table = soup.select_one("td.dbtbl table.bs[border='1']") or soup.select_one("table.bs[border='1']")
     horses = {}
     if not main_table: return header, horses, url, nar_race_level
@@ -418,7 +429,6 @@ def run_dify_with_blocking_robust(full_text):
         try:
             res = sess.post(url, headers=headers, json=payload, timeout=(10, 600))
             if res.status_code != 200:
-                # サーバーエラー系はリトライ
                 if res.status_code in [500, 502, 503, 504] and attempt < 2:
                     time.sleep(10)
                     continue
@@ -530,9 +540,10 @@ def _fetch_history_data(year, month, day, place_name, race_num, grades, kai, nic
 # メイン処理
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, ui=False):
-    # --- 【初期化】名前＆相性リストを一括読み込み ---
+    # --- 【初期化】名前＆相性リストを一括読み込み（修正済み） ---
     resources = load_data_resources()
-    name_list = resources["names"]
+    jockey_list = resources["jockeys"]   # 騎手専用リスト
+    trainer_list = resources["trainers"] # 調教師専用リスト
     stats_db = resources["stats"]
     # ---------------------------------------------
     
@@ -578,19 +589,20 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 for uma in all_uma:
                     kg = keibago_dict.get(uma, {})
                     
-                    # 1. 名前変換
-                    full_jockey = find_best_match(kg.get('jockey', ''), name_list)
-                    full_trainer = find_best_match(kg.get('trainer', ''), name_list)
+                    # 1. 名前変換 (騎手は騎手リスト、調教師は調教師リストから検索)
+                    # ★修正: 適切なリストを渡すことで精度向上
+                    full_jockey = find_best_match(kg.get('jockey', ''), jockey_list)
+                    full_trainer = find_best_match(kg.get('trainer', ''), trainer_list)
 
                     # 2. 相性データ取得
-                    # 修正点: get_compatibility 内部でスペースを完全除去して照合します
                     compatibility_info = get_compatibility(full_jockey, full_trainer, stats_db)
                     
                     # 表示用テキスト作成
                     prev_info = ""
                     if kg.get('is_change'):
                         pj = kg.get('prev_jockey', '')
-                        pj_full = find_best_match(pj, name_list)
+                        # ★修正: 前走騎手も騎手リストから検索
+                        pj_full = find_best_match(pj, jockey_list)
                         prev_info = f" 【⚠️乗り替わり】(前走:{pj_full})" if pj else " 【⚠️乗り替わり】"
 
                     # 3. テキストに相性情報を埋め込む
