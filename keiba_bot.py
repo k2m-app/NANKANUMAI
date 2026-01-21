@@ -98,13 +98,11 @@ def run_dify_prediction(full_text):
                         try:
                             data = json.loads(json_str)
                             # ワークフロー完了、またはテキスト生成イベントから文字を抽出
-                            # Difyの仕様によってキーが異なる場合があるため調整
                             event = data.get('event')
                             if event == 'workflow_finished':
                                 # 最終結果が含まれている場合
                                 outputs = data.get('data', {}).get('outputs', {})
                                 if 'text' in outputs:
-                                    # 完了時に全て上書きできるならそれが確実
                                     return outputs['text']
                             elif event == 'text_chunk' or event == 'message':
                                 # 少しずつ文字が送られてくる場合
@@ -119,7 +117,7 @@ def run_dify_prediction(full_text):
         return f"⚠️ API Connection Error: {e}"
 
 # ==================================================
-# データ読み込み
+# データ読み込み & 正規化ロジック
 # ==================================================
 @st.cache_resource
 def load_resources():
@@ -156,12 +154,45 @@ def load_resources():
     return res
 
 def normalize_name(abbrev, full_list):
+    """
+    略称(abbrev)から正式名称(full_list内の候補)を探す関数
+    「文字が順番通りに含まれているか（部分列マッチング）」を判定基準にする
+    """
     if not abbrev: return ""
-    clean = abbrev.replace(" ","").replace("　","")
+    
+    # 1. ゴミ取り（スペース、▲などの記号、数字、ドットを削除して純粋な漢字/カナだけにする）
+    # 生データが「▲木間龍56.0」などでもここで「木間龍」になります
+    clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
+    
+    if not clean: return ""
     if not full_list: return clean
-    if clean in full_list: return clean
-    matches = [n for n in full_list if n.startswith(clean) or (len(clean)>=2 and n.startswith(clean[0]) and clean[1] in n)]
-    return sorted(matches, key=len)[0] if matches else clean
+    
+    # 2. 完全一致があれば即終了（最速・確実）
+    if clean in full_list:
+        return clean
+
+    # 3. 部分列マッチング
+    # 「候補名」の中に「略称の文字」が「順番通り」に含まれているかチェック
+    candidates = []
+    
+    for full in full_list:
+        # イテレータを使って、fullの中にcleanの文字が順にあるか判定
+        # 例: clean="木間龍", full="木間塚龍馬" -> '木'ok '間'ok ('塚'skip) '龍'ok -> マッチ
+        it = iter(full)
+        if all(char in it for char in clean):
+            # マッチした場合、スコアを計算して候補に追加
+            # 文字数差が小さいほど良い（余計な文字が少ない＝正解に近い）
+            diff = len(full) - len(clean)
+            candidates.append((diff, full))
+    
+    # 4. 候補が見つかった場合
+    if candidates:
+        # 文字数差が小さい順（diffが小さい順）に並べ替えて、先頭を返す
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    # 5. 候補がない場合はそのまま返す
+    return clean
 
 # ==================================================
 # 開催特定 & URL生成
@@ -294,6 +325,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if len(links) >= 1: j_raw = links[0].get_text(strip=True)
                 if len(links) >= 2: t_raw = links[1].get_text(strip=True)
             
+            # 生テキストを渡せば関数内で浄化・マッチングされる
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
             power_info = resources["power"].get((place_name, j_full), "P:不明")
@@ -348,11 +380,14 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         pm = re.search(r"(\d+)人気", pt)
                         if pm: pop = f"{pm.group(1)}人"
                         sps = p.find_all("span")
-                        if len(sps)>1: j_prev = re.sub(r"[\d\.]+", "", sps[1].get_text(strip=True))
+                        # 過去騎手: 「木間龍56.0」などをそのまま取得
+                        if len(sps) > 1: 
+                            j_prev = sps[1].get_text(strip=True)
                     if "3F" in pt:
                         am = re.search(r"\(([\d]+)\)", pt)
                         if am: agari = f"3F{am.group(1)}位"
                 
+                # ここで「木間龍56.0」等を渡すと「木間塚龍馬」等に自動変換される
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 
                 # 前回騎手パワー
@@ -526,22 +561,14 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
                 if ui: st.info("🤖 AI分析中...")
                 ai_out = run_dify_prediction(full_prompt)
                 
-                # (前略)
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table(nk_id, grades)
 
-                # ▼▼▼ 修正箇所ここから ▼▼▼
-
                 # 1. AI出力(ai_out)から、ハイフンだけの行（区切り線）を削除する処理
-                # ※テーブルの構造（|---|）は消さずに、単独の区切り線（------）だけを消します
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
-                # 空行が続きすぎるのを防ぐ（3つ以上の改行を2つにする）
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
-                # 2. 「=== 📊分析データ(抜粋) ===」を含めずに final を作成
                 final = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
-
-                # ▲▲▲ 修正箇所ここまで ▲▲▲
                 
                 if ui: st.success("✅ 完了")
                 yield (r_num, final)
