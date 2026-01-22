@@ -7,12 +7,14 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 
-# Selenium & Chrome
+# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+
+# HTML Parsing & Network
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -25,18 +27,17 @@ JOCKEY_FILE = os.path.join(DATA_DIR, "2025_NARJockey.csv")
 TRAINER_FILE = os.path.join(DATA_DIR, "2025_NankanTrainer.csv")
 POWER_FILE = os.path.join(DATA_DIR, "2025_騎手パワー.csv")
 
-# Streamlit Secrets (未設定時のデフォルト値対応)
+# Secrets
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 # ==================================================
-# 2. 共通ユーティリティ関数
+# 2. 共通関数（ネットワーク・Selenium）
 # ==================================================
 @st.cache_resource
 def get_http_session() -> requests.Session:
-    """HTTPリクエストのセッション管理（リトライ機能付き）"""
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
@@ -48,26 +49,22 @@ def get_http_session() -> requests.Session:
     return sess
 
 def get_driver():
-    """Seleniumドライバーの安全な起動"""
     ops = Options()
-    ops.add_argument("--headless=new") # 最新のヘッドレスモード
+    ops.add_argument("--headless=new")
     ops.add_argument("--no-sandbox")
-    ops.add_argument("--disable-dev-shm-usage") # メモリ不足エラー回避
+    ops.add_argument("--disable-dev-shm-usage")
     ops.add_argument("--disable-gpu")
-    ops.add_argument("--window-size=1280,1024")
     ops.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=ops)
 
 def login_keibabook_robust(driver):
-    """競馬ブックへのログイン処理"""
     try:
         driver.get("https://s.keibabook.co.jp/login/login")
         time.sleep(1)
-        # ログアウトボタンがあればログイン済みとみなす
-        if "logout" in driver.current_url or len(driver.find_elements(By.XPATH, "//a[contains(@href,'logout')]")) > 0:
+        # ログアウトボタン等があればログイン済みと判定
+        if "logout" in driver.current_url or driver.find_elements(By.XPATH, "//a[contains(@href,'logout')]"):
             return True
             
-        # ログイン試行
         WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
         driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
         driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
@@ -78,16 +75,15 @@ def login_keibabook_robust(driver):
         return False
 
 # ==================================================
-# 3. Dify API連携
+# 3. Dify API (ストリーミング版・完全復活)
 # ==================================================
 def run_dify_prediction(full_text):
-    """Dify APIを呼び出してテキスト生成"""
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
     payload = {
         "inputs": {"text": full_text}, 
-        "response_mode": "blocking", # エラー回避のためblocking推奨だが、タイムアウト注意
+        "response_mode": "streaming", 
         "user": "keiba-bot"
     }
     headers = {
@@ -95,28 +91,42 @@ def run_dify_prediction(full_text):
         "Content-Type": "application/json"
     }
     
+    sess = get_http_session()
+    full_response = ""
+    
     try:
-        # タイムアウトを長めに設定
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        if resp.status_code == 200:
-            data = resp.json()
-            # ワークフローの出力構造に合わせて調整
-            outputs = data.get('data', {}).get('outputs', {})
-            return outputs.get('text', str(outputs))
-        else:
-            return f"⚠️ API Error: {resp.status_code} - {resp.text[:100]}"
+        with sess.post(url, headers=headers, json=payload, stream=True, timeout=120) as res:
+            if res.status_code != 200:
+                return f"⚠️ Dify Error ({res.status_code}): {res.text[:200]}..."
+            
+            for line in res.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    if decoded_line.startswith('data:'):
+                        json_str = decoded_line[5:].strip()
+                        if not json_str: continue
+                        try:
+                            data = json.loads(json_str)
+                            event = data.get('event')
+                            if event == 'workflow_finished':
+                                outputs = data.get('data', {}).get('outputs', {})
+                                if 'text' in outputs: return outputs['text']
+                            elif event == 'text_chunk' or event == 'message':
+                                chunk = data.get('data', {}).get('text', '')
+                                full_response += chunk
+                        except: pass
+        return full_response if full_response else "（回答生成エラー）"
     except Exception as e:
-        return f"⚠️ Connection Error: {e}"
+        return f"⚠️ API Connection Error: {e}"
 
 # ==================================================
-# 4. データ処理ロジック
+# 4. データロード & ユーティリティ
 # ==================================================
 @st.cache_resource
 def load_resources():
-    """CSVデータの読み込み"""
     res = {"jockeys": [], "trainers": [], "power": {}, "power_data": {}}
     
-    # 騎手・調教師リスト読み込み
+    # 騎手・調教師
     for fpath, key in [(JOCKEY_FILE, "jockeys"), (TRAINER_FILE, "trainers")]:
         if os.path.exists(fpath):
             try:
@@ -124,7 +134,7 @@ def load_resources():
                     res[key] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
             except: pass
             
-    # 騎手パワー読み込み
+    # パワーファイル
     if os.path.exists(POWER_FILE):
         try:
             df = pd.read_csv(POWER_FILE, encoding="utf-8-sig")
@@ -134,254 +144,481 @@ def load_resources():
                 j = str(row.get("騎手名", "")).replace(" ","").replace("　","")
                 if p and j:
                     val = row.get('騎手パワー','-')
-                    res["power"][(p, j)] = f"P:{val}"
-                    res["power_data"][(p, j)] = {"power": val}
+                    win = row.get('勝率','-')
+                    fuku = row.get('複勝率','-')
+                    info = f"P:{val}(勝{win} 複{fuku})"
+                    key_t = (p, j)
+                    res["power"][key_t] = info
+                    res["power_data"][key_t] = {"power": val, "win": win, "fuku": fuku}
         except: pass
     return res
 
 def normalize_name(abbrev, full_list):
-    """略称から正式名称を検索"""
-    if not abbrev or not full_list: return abbrev
+    if not abbrev: return ""
     clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
+    if not clean: return ""
+    if not full_list: return clean
     
-    # 完全一致
     if clean in full_list: return clean
     
-    # 部分一致検索
     candidates = []
     for full in full_list:
-        if all(c in full for c in clean): # 文字がすべて含まれているか
-            candidates.append((len(full) - len(clean), full))
-    
+        if all(c in full for c in clean):
+            diff = len(full) - len(clean)
+            candidates.append((diff, full))
+            
     if candidates:
-        candidates.sort() # 文字数差が小さい順
+        candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
         
     return clean
 
-# ==================================================
-# 5. スクレイピング & 解析コア
-# ==================================================
+def get_nankan_kai_nichi(month, day, place_name):
+    """開催回の特定ロジック（オリジナル版）"""
+    url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
+    sess = get_http_session()
+    try:
+        res = sess.get(url, timeout=10)
+        res.encoding = 'cp932'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        target_m, target_d = int(month), int(day)
+        
+        for tr in soup.find_all('tr'):
+            text = tr.get_text(" ", strip=True)
+            if place_name not in text: continue
+            
+            kai_m = re.search(r'第\s*(\d+)\s*回', text)
+            if not kai_m: continue
+            kai = int(kai_m.group(1))
+            
+            mon_m = re.search(r'(\d+)\s*月', text)
+            if not mon_m: continue
+            if int(mon_m.group(1)) != target_m: continue
+            
+            days_part = text.split("月")[1]
+            days_match = re.findall(r'(\d+)', days_part)
+            days_list = [int(d) for d in days_match if 1 <= int(d) <= 31]
+            
+            if target_d in days_list:
+                return kai, days_list.index(target_d) + 1
+        return None, None
+    except: return None, None
+
 def get_kb_url_id(year, month, day, place_code, nichi, race_num):
     return f"{year}{str(month).zfill(2)}{str(place_code).zfill(2)}{str(nichi).zfill(2)}{str(race_num).zfill(2)}{str(month).zfill(2)}{str(day).zfill(2)}"
 
+# ==================================================
+# 5. スクレイピングロジック（オリジナル版の完全復活）
+# ==================================================
+def parse_kb_danwa_cyokyo(driver, kb_id):
+    """競馬ブックの談話と調教を詳細に取得"""
+    d_danwa, d_cyokyo = {}, {}
+    try:
+        # --- 談話 ---
+        driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
+        if "login" in driver.current_url:
+            login_keibabook_robust(driver)
+            driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
+        
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        for tbl in soup.select("table.danwa"):
+            curr = None
+            for tr in tbl.select("tbody tr"):
+                u = tr.select_one("td.umaban")
+                if u: curr = u.get_text(strip=True); continue
+                t = tr.select_one("td.danwa")
+                if curr and t: 
+                    raw_text = t.get_text(" ", strip=True)
+                    m = re.search(r'[―-]+(.*)', raw_text)
+                    if m: d_danwa[curr] = m.group(1).strip()
+                    else: d_danwa[curr] = raw_text 
+                    curr = None
+
+        # --- 調教 ---
+        driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        for tbl in soup.select("table.cyokyo"):
+            rows = tbl.select("tbody tr")
+            if not rows: continue
+            r1 = rows[0]
+            u_td = r1.select_one("td.umaban")
+            if not u_td: continue
+            uma = u_td.get_text(strip=True)
+            tp_txt = r1.select_one("td.tanpyo").get_text(strip=True) if r1.select_one("td.tanpyo") else ""
+            
+            dt_txt = ""
+            if len(rows) > 1:
+                dt_raw = rows[1].get_text(" ", strip=True)
+                dt_txt = re.sub(r'\s+', ' ', dt_raw)
+            
+            d_cyokyo[uma] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
+    except: pass
+    return d_danwa, d_cyokyo
+
 def parse_nankankeiba_detail(html, place_name, resources):
-    """南関競馬の出馬表HTMLを解析"""
+    """南関競馬の詳細データを解析（履歴3走分含む）"""
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
-    
-    # レース情報
+
     h3 = soup.find("h3", class_="nk23_c-tab1__title")
-    data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else "不明"
+    data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else ""
+    if data["meta"]["race_name"]:
+        parts = re.split(r'[ 　]+', data["meta"]["race_name"])
+        data["meta"]["grade"] = parts[-1] if len(parts) > 1 else ""
     
+    cond = soup.select_one("a.nk23_c-tab1__subtitle__text.is-blue")
+    data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
+
     table = soup.select_one("#shosai_aria table.nk23_c-table22__table")
     if not table: return data
 
     for row in table.select("tbody tr"):
         try:
-            # 馬番
             u_tag = row.select_one("td.umaban") or row.select_one("td.is-col02")
             if not u_tag: continue
             umaban = u_tag.get_text(strip=True)
             if not umaban.isdigit(): continue
             
-            # 馬名
-            h_link = row.select_one("td.is-col03 a.is-link")
-            horse_name = h_link.get_text(strip=True) if h_link else "不明"
-            
-            # 騎手・調教師
-            j_full, t_full = "不明", "不明"
+            horse_name = "不明"
+            h_link = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
+            if h_link: horse_name = h_link.get_text(strip=True)
+            else:
+                td3 = row.select_one("td.is-col03")
+                if td3:
+                    txt = td3.get_text(" ", strip=True)
+                    m_nm = re.search(r'[ァ-ンー]{2,9}', txt)
+                    if m_nm: horse_name = m_nm.group(0)
+
             jg_td = row.select_one("td.cs-g1")
+            j_raw, t_raw = "", ""
             if jg_td:
                 links = jg_td.select("a")
-                if len(links) >= 1: j_full = normalize_name(links[0].get_text(strip=True), resources["jockeys"])
-                if len(links) >= 2: t_full = normalize_name(links[1].get_text(strip=True), resources["trainers"])
+                if len(links) >= 1: j_raw = links[0].get_text(strip=True)
+                if len(links) >= 2: t_raw = links[1].get_text(strip=True)
             
-            # 騎手パワー
+            j_full = normalize_name(j_raw, resources["jockeys"])
+            t_full = normalize_name(t_raw, resources["trainers"])
             power_info = resources["power"].get((place_name, j_full), "P:不明")
-            
-            # 履歴データの抽出（簡易版）
-            histories = []
+
+            ai2 = row.select_one("td.cs-ai2 .graph_text_div")
+            pair_stats = "-"
+            if ai2 and "データ" not in ai2.get_text():
+                r = ai2.select_one(".is-percent").get_text(strip=True)
+                w = ai2.select_one(".is-number").get_text(strip=True)
+                t = ai2.select_one(".is-total").get_text(strip=True)
+                pair_stats = f"勝{r}({w}/{t})" 
+
+            history = []
+            prev_power_info = ""
+
+            # 過去3走の解析 (cs-z1 ~ cs-z3)
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
-                if z and z.get_text(strip=True):
-                    # 順位や条件だけ抜く
-                    rank = z.select_one(".nk23_u-text19")
-                    rank_txt = rank.get_text(strip=True) if rank else "?"
-                    histories.append(f"{i}走前:{rank_txt}着")
-            
+                if not z or not z.get_text(strip=True): continue
+                
+                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
+                d_txt = ""
+                if d_spans:
+                    for s in d_spans:
+                        if re.search(r"\d+\.\d+\.\d+", s.get_text()): d_txt = s.get_text(strip=True); break
+                
+                ymd, place_short = "", ""
+                m = re.match(r"([^\d]+)(\d+)\.(\d+)\.(\d+)", d_txt)
+                if m:
+                    place_short = m.group(1)
+                    ymd = f"{m.group(2)}/{int(m.group(3))}/{int(m.group(4))}"
+                
+                cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
+                dist_m = re.search(r"\d{4}", cond_txt)
+                dist = dist_m.group(0) if dist_m else ""
+                course_s = f"{place_short}{dist}" if m else cond_txt
+
+                r_a = z.select_one("a.is-link")
+                r_ti = r_a.get("title", "") if r_a else ""
+                rp = re.split(r'[ 　]+', r_ti)
+                r_cl = rp[1] if len(rp)>1 else ""
+
+                p_lines = z.select("p.nk23_u-text10")
+                j_prev, pop, agari = "", "", ""
+                rank = z.select_one(".nk23_u-text19").get_text(strip=True).replace("着","") if z.select_one(".nk23_u-text19") else ""
+                
+                pos_p = z.select_one("p.position")
+                pas = "-".join([s.get_text(strip=True) for s in pos_p.find_all("span")]) if pos_p else ""
+
+                for p in p_lines:
+                    pt = p.get_text(strip=True)
+                    if "人気" in pt:
+                        pm = re.search(r"(\d+)人気", pt)
+                        if pm: pop = f"{pm.group(1)}人"
+                        sps = p.find_all("span")
+                        if len(sps) > 1: j_prev = sps[1].get_text(strip=True)
+                    if "3F" in pt:
+                        am = re.search(r"\(([\d]+)\)", pt)
+                        if am: agari = f"3F{am.group(1)}位"
+                
+                j_prev_full = normalize_name(j_prev, resources["jockeys"])
+                
+                if i == 1:
+                    p_data = resources["power_data"].get((place_short, j_prev_full))
+                    if p_data: prev_power_info = f"前P:{p_data['power']}"
+
+                h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
+                history.append(h_str)
+
             data["horses"][umaban] = {
-                "name": horse_name,
-                "jockey": j_full,
-                "trainer": t_full,
-                "power": power_info,
-                "history": " ".join(histories)
+                "name": horse_name, "jockey": j_full, "trainer": t_full,
+                "power": power_info, "prev_power": prev_power_info,
+                "compat": pair_stats, "hist": history, 
+                "prev_jockey_name": history[0].split(" ")[3] if history else ""
             }
         except Exception: continue
-        
     return data
 
+def _parse_grades_from_ai(text):
+    grades = {}
+    for line in text.split('\n'):
+        m = re.search(r'([SABCDE])\s*[:：]?\s*([^\s　]+)', line)
+        if m:
+            g, n = m.group(1), re.sub(r'[（\(].*?[）\)]', '', m.group(2)).strip()
+            if n: grades[n] = g
+    return grades
+
+def _fetch_matchup_table(nankan_id, grades):
+    """対戦表の取得とAI評価のマージ（オリジナル版復活）"""
+    url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
+    sess = get_http_session()
+    try:
+        soup = BeautifulSoup(sess.get(url, timeout=10).content, 'html.parser', from_encoding='cp932')
+        tbl = soup.find('table', class_='nk23_c-table08__table')
+        if not tbl: return "\n(対戦データなし)"
+
+        races = []
+        if tbl.find('thead'):
+            for col in tbl.find('thead').find_all(['th','td'])[2:]:
+                det = col.find(class_='nk23_c-table08__detail')
+                if det:
+                    link = col.find('a')
+                    races.append({
+                        "title": det.get_text(" ", strip=True),
+                        "url": "https://www.nankankeiba.com" + link.get('href','') if link else "",
+                        "results": []
+                    })
+        if not races: return "\n(初対戦)"
+
+        if tbl.find('tbody'):
+            for tr in tbl.find('tbody').find_all('tr'):
+                u = tr.find('a', class_='nk23_c-table08__text')
+                if not u: continue
+                name = u.get_text(strip=True)
+                grade = grades.get(name, "")
+                if not grade:
+                    for k,v in grades.items():
+                        if k in name or name in k: grade = v; break
+                
+                cells = tr.find_all(['td','th'])
+                idx_st = -1
+                for i, c in enumerate(cells):
+                    if c.find('a', class_='nk23_c-table08__text'): idx_st=i; break
+                if idx_st == -1: continue
+
+                for i, c in enumerate(cells[idx_st+1:]):
+                    if i >= len(races): break
+                    rp = c.find('p', class_='nk23_c-table08__number')
+                    rnk = ""
+                    if rp:
+                        sp = rp.find('span')
+                        rnk = sp.get_text(strip=True) if sp else rp.get_text(strip=True).split('｜')[0].strip()
+                    if rnk and (rnk.isdigit() or rnk in ['除外','中止']):
+                        races[i]["results"].append({"rank":rnk, "name":name, "grade":grade, "sort":int(rnk) if rnk.isdigit() else 999})
+
+        out = ["\n【対戦表（AI評価付き）】"]
+        for r in races:
+            if not r["results"]: continue
+            r["results"].sort(key=lambda x:x["sort"])
+            line_parts = []
+            for x in r["results"]:
+                g = f"[{x['grade']}]" if x['grade'] else ""
+                line_parts.append(f"{x['rank']}着 {x['name']}{g}")
+            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts) + f"\n詳細: {r['url']}\n")
+        return "\n".join(out)
+    except: return "(対戦表エラー)"
+
 # ==================================================
-# 6. メインロジック（ジェネレータ）
+# 6. ジェネレータ（データ受け渡しの中核）
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races):
     """
-    UIに依存せず、結果を辞書形式でyieldするジェネレータ
-    Return形式: {"type": "log"|"result"|"error", "data": ...}
+    辞書形式でステータスと結果をYieldする安全なジェネレータ
+    yield {"type": "status"|"error"|"result", "data": ...}
     """
-    driver = None
     resources = load_resources()
+    kb_input_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
+    nk_code_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
     
-    # 開催地コード変換
-    kb_place_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
-    nk_place_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
-    place_name = kb_place_map.get(place_code, "地方")
-    nk_code = nk_place_map.get(place_code)
+    place_name = kb_input_map.get(place_code, "地方")
+    nk_place_code = nk_code_map.get(place_code)
+
+    driver = get_driver()
+    wait = WebDriverWait(driver, 10)
 
     try:
-        driver = get_driver()
-        
-        # 1. 開催特定
-        yield {"type": "log", "data": f"📅 {place_name}の開催日を特定中..."}
-        
-        # 南関競馬カレンダーから回・日次を取得
-        kai, nichi = None, None
-        driver.get("https://www.nankankeiba.com/bangumi_menu/bangumi.do")
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
-        target_str = f"{int(month)}月"
-        for tr in soup.find_all('tr'):
-            txt = tr.get_text(" ", strip=True)
-            if place_name in txt and target_str in txt:
-                # 簡易的な判定（実際は日付マッチングが必要だが、エラー回避のため簡略化）
-                # 実際にはここで対象日の回・日次を特定するロジックが入ります
-                # 今回は仮に計算できたとするか、詳細ロジックを実行
-                days_part = txt.split("月")[1]
-                if str(int(day)) in days_part:
-                     m_kai = re.search(r'第(\d+)回', txt)
-                     if m_kai:
-                         kai = int(m_kai.group(1))
-                         # 日次の特定は複雑なため、ここでは安全策として「1日目」と仮定するか
-                         # または日付リストからインデックスを取得
-                         days_nums = re.findall(r'\d+', days_part)
-                         if str(int(day)) in days_nums:
-                             nichi = days_nums.index(str(int(day))) + 1
-                         else: nichi = 1
-                         break
-        
+        yield {"type": "status", "data": f"📅 開催特定中 ({place_name})..."}
+        kai, nichi = get_nankan_kai_nichi(month, day, place_name)
         if not kai:
-            # 見つからない場合はURLから推測アプローチ（非推奨だが動くように）
-            kai, nichi = 1, 1 
-            yield {"type": "log", "data": "⚠️ 開催回が特定できないため、第1回1日目として試行します"}
-        
-        yield {"type": "log", "data": f"✅ {place_name} 第{kai}回 {nichi}日目 設定完了"}
+            yield {"type": "error", "data": "開催特定失敗。URLや日付を確認してください。"}
+            return
+        yield {"type": "status", "data": f"✅ {place_name} 第{kai}回 {nichi}日目"}
 
-        # 2. ログイン
+        yield {"type": "status", "data": "🔑 競馬ブック ログイン中..."}
         login_keibabook_robust(driver)
 
-        # 3. レースループ
-        r_nums = target_races if target_races else range(1, 13)
-        
+        prog_url = f"https://www.nankankeiba.com/program/{year}{month}{day}{nk_place_code}.do"
+        driver.get(prog_url)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        r_nums = []
+        for a in soup.find_all("a", href=True):
+            if f"{year}{month}{day}{nk_place_code}" in a["href"] and "uma_shosai" not in a["href"]:
+                f = a["href"].split("/")[-1].replace(".do","")
+                if len(f)==16: r_nums.append(int(f[14:16]))
+        r_nums = sorted(list(set(r_nums))) or range(1, 13)
+
         for r_num in r_nums:
-            yield {"type": "log", "data": f"🏇 {r_num}R データ収集中..."}
+            if target_races and r_num not in target_races: continue
+            
+            yield {"type": "status", "data": f"🏇 {r_num}R データ解析中..."}
             
             try:
-                # ID生成
-                nk_id = f"{year}{month}{day}{nk_code}{kai:02}{nichi:02}{r_num:02}"
+                nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
+                kb_id = get_kb_url_id(year, month, day, place_code, nichi, r_num)
                 
-                # データ取得
+                # 詳細データの取得
+                danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
                 
                 if not nk_data["horses"]:
-                    yield {"type": "error", "data": f"{r_num}R: データが見つかりませんでした (URL: {driver.current_url})"}
+                    yield {"type": "result", "race_num": r_num, "data": "⚠️ データが見つかりませんでした"}
                     continue
-                
+
                 # プロンプト作成
-                lines = [f"レース: {r_num}R {nk_data['meta']['race_name']}"]
-                for u, h in nk_data["horses"].items():
-                    lines.append(f"[{u}] {h['name']} (騎:{h['jockey']} P:{h['power']}) 履歴:{h['history']}")
+                header = f"レース名:{r_num}R {nk_data['meta'].get('race_name','')} 格:{nk_data['meta'].get('grade','')} コース:{nk_data['meta'].get('course','')}"
+                horse_texts = []
                 
-                full_text = "\n".join(lines)
+                for u in sorted(nk_data["horses"].keys(), key=int):
+                    h = nk_data["horses"][u]
+                    p_jockey = h.get("prev_jockey_name", "")
+                    p_info = f"(前:{p_jockey})" if p_jockey else ""
+                    power_line = f"【騎手】{h['power']}、{h['prev_power']} 相性:{h['compat']}"
+                    
+                    block = [
+                        f"[{u}]{h['name']} 騎:{h['jockey']}{p_info} 師:{h['trainer']}",
+                        f"話:{danwa.get(u,'なし')}", 
+                        f"調:{cyokyo.get(u,'データなし')}",
+                        power_line,
+                        "【近走】"
+                    ]
+                    cn_map = {0:"[前走]", 1:"[2走前]", 2:"[3走前]"}
+                    for idx, hs in enumerate(h["hist"]):
+                        prefix = cn_map.get(idx, f"[{idx+1}走]")
+                        block.append(f"{prefix} {hs}")
+                    
+                    horse_texts.append("\n".join(block))
                 
-                # AI分析
-                yield {"type": "log", "data": f"🤖 {r_num}R AI分析実行中..."}
-                ai_result = run_dify_prediction(full_text)
+                full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
                 
-                # 結果結合
-                final_output = f"=== {r_num}R 予想 ===\n\n{ai_result}"
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測生成中..."}
+                ai_out = run_dify_prediction(full_prompt)
                 
-                # 成功としてYield
-                yield {"type": "result", "race_num": r_num, "data": final_output}
+                # グレード抽出 & 対戦表生成
+                grades = _parse_grades_from_ai(ai_out)
+                match_txt = _fetch_matchup_table(nk_id, grades)
                 
-                time.sleep(1) # サーバー負荷軽減
+                # クリーニング
+                ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
+                ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
+
+                final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
+                
+                # 結果送信
+                yield {"type": "result", "race_num": r_num, "data": final_text}
+                
+                time.sleep(2) # 負荷調整
 
             except Exception as e:
-                yield {"type": "error", "data": f"{r_num}R 処理エラー: {e}"}
-                
+                yield {"type": "result", "race_num": r_num, "data": f"Error: {e}"}
+
     except Exception as e:
-        yield {"type": "error", "data": f"致命的エラー: {e}"}
+        yield {"type": "error", "data": f"Fatal Error: {e}"}
     finally:
-        if driver:
-            driver.quit()
+        driver.quit()
 
 # ==================================================
-# 7. UI メイン処理 (Streamlit)
+# 7. UI メイン (Streamlit)
 # ==================================================
 def main():
-    st.set_page_config(page_title="NANKAN AI Robust", layout="wide")
-    st.title("🏇 NANKAN AI (Stable Version)")
+    st.set_page_config(page_title="NANKAN AI Master Pro", layout="wide")
+    st.title("🏇 NANKAN AI Master Pro")
+
+    # --- Sidebar ---
+    st.sidebar.header("設定")
+    today = datetime.now()
+    col1, col2 = st.sidebar.columns(2)
+    s_year = col1.number_input("年", value=today.year)
+    s_month = col2.number_input("月", value=today.month)
+    s_day = st.sidebar.number_input("日", value=today.day)
+    s_place = st.sidebar.selectbox("場所", 
+        options=["10","11","12","13"], 
+        format_func=lambda x: {"10":"大井","11":"川崎","12":"船橋","13":"浦和"}.get(x)
+    )
     
-    # サイドバー
-    st.sidebar.header("実行設定")
-    d_now = datetime.now()
-    year = st.sidebar.number_input("年", value=d_now.year)
-    month = st.sidebar.number_input("月", value=d_now.month)
-    day = st.sidebar.number_input("日", value=d_now.day)
-    place_code = st.sidebar.selectbox("開催地", ["10","11","12","13"], format_func=lambda x: {"10":"大井","11":"川崎","12":"船橋","13":"浦和"}.get(x))
+    target_race_input = st.sidebar.text_input("レース指定 (例: 1,2,11 / 空白で全R)", "")
     
-    races_str = st.sidebar.text_input("レース指定 (例: 1,2,11 / 空白で全R)", "")
-    
-    # 結果保存用（リロード対策）
+    # State初期化
     if "results" not in st.session_state:
         st.session_state.results = {}
-    
+
     # 実行ボタン
     if st.sidebar.button("分析開始", type="primary"):
-        target_races = [int(x.strip()) for x in races_str.split(",")] if races_str.strip() else []
+        target_races = [int(x.strip()) for x in target_race_input.split(",")] if target_race_input.strip() else []
         
-        # ログ表示エリア
-        log_area = st.empty()
+        st.session_state.logs = []
+        status_container = st.status("🚀 システム起動中...", expanded=True)
         
-        # ジェネレータ実行
-        # ここでの変数 `event` は辞書型 {"type":..., "data":...} なのでアンパックエラーは起きない
-        for event in run_races_iter(year, month, day, place_code, target_races):
+        # ジェネレータから辞書を受け取る（エラー回避の要）
+        for event in run_races_iter(s_year, s_month, s_day, s_place, target_races):
             
-            if event["type"] == "log":
-                log_area.info(event["data"])
+            e_type = event.get("type")
+            e_data = event.get("data")
+            
+            if e_type == "status":
+                status_container.write(e_data)
                 
-            elif event["type"] == "error":
-                st.error(event["data"])
+            elif e_type == "error":
+                status_container.error(e_data)
                 
-            elif event["type"] == "result":
-                r_num = event["race_num"]
-                res_text = event["data"]
-                st.session_state.results[r_num] = res_text
-                st.success(f"{r_num}R 完了")
-                
-        log_area.success("✨ 全処理が完了しました")
+            elif e_type == "result":
+                r_num = event.get("race_num")
+                st.session_state.results[r_num] = e_data
+                status_container.write(f"✅ {r_num}R 分析完了")
+        
+        status_container.update(label="✨ 全処理完了", state="complete", expanded=False)
 
-    # 結果表示
+    # 結果表示（Stateから読み出し）
     st.divider()
-    st.subheader("📊 分析結果")
-    
-    if st.session_state.results:
-        # レース順にソートして表示
-        for r in sorted(st.session_state.results.keys()):
-            with st.expander(f"🏁 {r}レースの結果", expanded=False):
-                st.text(st.session_state.results[r])
+    st.subheader(f"📊 分析結果一覧 ({len(st.session_state.results)}レース済)")
+
+    if not st.session_state.results:
+        st.info("👈 サイドバーから分析を開始してください")
     else:
-        st.info("サイドバーから分析を開始してください。")
+        sorted_keys = sorted(st.session_state.results.keys())
+        for r in sorted_keys:
+            txt = st.session_state.results[r]
+            with st.expander(f"🏁 {r}R の予想結果を見る", expanded=False):
+                st.code(txt, language="text")
+
+    if st.sidebar.button("結果クリア"):
+        st.session_state.results = {}
+        st.rerun()
 
 if __name__ == "__main__":
     main()
