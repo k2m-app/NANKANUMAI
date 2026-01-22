@@ -382,11 +382,23 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 dm = re.search(r"(\d{3,4})m?", z_full_text)
                 dist = dm.group(1) if dm else ""
 
-                # 3. 着順
+                # ==================================================
+                # ★ 3. 着順 (修正：能試・取消・除外に対応)
+                # ==================================================
                 rank = ""
+                # 通常の着順タグ (例: 1着, 2着...)
                 r_tag = z.select_one(".nk23_u-text19")
+                
                 if r_tag:
+                    # 数字のみを取り出す
                     rank = r_tag.get_text(strip=True).replace("着", "")
+                else:
+                    # 着順がない場合、特殊タグ(能試、取消、除外など)を探す
+                    special_tag = z.select_one(".nk23_u-text16")
+                    if special_tag:
+                        # "能試" や "取消" という文字をそのまま取得
+                        rank = special_tag.get_text(strip=True)
+                # ==================================================
 
                 # 4. 騎手(略称)・人気
                 j_prev, pop = "", ""
@@ -403,18 +415,13 @@ def parse_nankankeiba_detail(html, place_name, resources):
                             j_prev = re.sub(r"[\d\.]+", "", j_cand)
                         break
 
-                # ==================================================
-                # ★ 5. 上がり3F (ここを修正＆古いコードを完全削除)
-                # ==================================================
+                # 5. 上がり3F (タグ取得版)
                 agari = ""
                 ft_elem = z.select_one(".furlongtime")
-                
                 if ft_elem:
-                    # テキストをそのまま取得 ("3F 39.3" 等)
                     raw_agari = ft_elem.get_text(strip=True)
                     if raw_agari:
                         agari = raw_agari
-                # ==================================================
 
                 # 6. 通過順
                 pos_p = z.select_one("p.position")
@@ -435,14 +442,23 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if p_data_prev:
                         prev_power_val = p_data_prev["power"]
 
-                # --- 文字列生成 ---
-                # agariには既に "3F 39.3" と入っているので、そのままカッコで囲む
-                agari_part = f"({agari})" if agari else "()"
+                # ==================================================
+                # ★ 文字列生成 (修正：着順の表示分け)
+                # ==================================================
+                agari_part = f"({agari})" if agari else ""
                 pop_part = f"({pop})" if pop else ""
-                rank_part = f"{rank}着" if rank else "着不明"
+                
+                # rankが数字なら「着」をつける。それ以外（能試・取消など）ならそのまま表示。
+                if rank.isdigit():
+                    rank_part = f"{rank}着"
+                elif rank:
+                    rank_part = rank  # "能試", "取消" など
+                else:
+                    rank_part = "着不明"
 
                 h_str = f"{d_txt} {place_short}{dist} {j_prev_full} {pas}{agari_part}→{rank_part}{pop_part}"
                 history.append(h_str)
+                # ==================================================
             # --- 最終表示用 ---
             if prev_power_val:
                 power_line = f"【騎手】{curr_power_str}(前P:{prev_power_val})、 相性:{pair_stats}"
