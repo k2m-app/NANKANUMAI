@@ -13,6 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException
 
 # HTML Parsing & Network
 from bs4 import BeautifulSoup
@@ -227,6 +228,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
         data["meta"]["grade"] = parts[-1] if len(parts) > 1 else ""
     cond = soup.select_one("a.nk23_c-tab1__subtitle__text.is-blue")
     data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
+    
+    # 待機処理後に取得したHTMLなのでテーブルは存在するはずだが念のため
     table = soup.select_one("#shosai_aria table.nk23_c-table22__table")
     if not table: return data
     
@@ -261,30 +264,24 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
             
             history = []
-            prev_power_info = ""
-            first_prev_jockey_full = ""
+            prev_power_info = "" 
+            first_prev_jockey_full = "" 
             
-            # HTML構造に基づく過去走解析
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z: continue
-                # 空セルチェック
-                if not z.get_text(strip=True): continue
+                z_full_text = z.get_text(" ", strip=True)
+                if not z_full_text: continue
 
                 d_txt = ""
-                # 日付：<span class="nk23_u-text10">船橋25.12.11</span> のような構造
                 d_div = z.select_one("p.nk23_u-d-flex")
                 if d_div:
-                    # テキスト全体から日付を探す
                     d_full = d_div.get_text(strip=True)
-                    # "船橋25.12.11" -> "25.12.11"
                     m_dt = re.search(r"(\d+\.\d+\.\d+)", d_full)
                     if m_dt: d_txt = m_dt.group(1)
 
-                # 開催地の特定
                 place_short = place_name
                 if d_div:
-                     # 開催地名は日付の前にあることが多い
                      p_match = re.search(r"([^\d]+)\d+\.\d+\.\d+", d_div.get_text(strip=True))
                      if p_match:
                          raw_p = p_match.group(1).strip()
@@ -292,66 +289,47 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
                 ymd = d_txt if d_txt else "不明"
                 
-                # レース名
                 r_a = z.select_one("a.is-link")
                 r_cl = r_a.get_text(strip=True) if r_a else ""
                 
-                # 着順
                 rank = ""
                 r_tag = z.select_one(".nk23_u-text19")
                 if r_tag: rank = r_tag.get_text(strip=True).replace("着","")
 
-                # 人気・騎手・斤量
-                # 構造: <p class="nk23_u-text10"><span class="popularity">...</span><span>濱田達56.0</span></p>
                 j_prev, pop = "", ""
                 p_lines = z.select("p.nk23_u-text10")
                 for p in p_lines:
-                    # <span>が2つある行を探す
                     spans = p.find_all("span")
                     if len(spans) >= 2:
-                        # 1つ目が人気を含むかチェック
                         if "人気" in spans[0].get_text():
                             pop_text = spans[0].get_text(strip=True)
                             pm = re.search(r"(\d+)人気", pop_text)
                             if pm: pop = f"{pm.group(1)}人"
-                            
-                            # 2つ目が騎手+斤量 "濱田達56.0"
                             j_raw_text = spans[1].get_text(strip=True)
-                            # 数字の前までを騎手名とする
                             jm = re.match(r"([^\d]+)", j_raw_text)
                             if jm: j_prev = jm.group(1).strip()
                             break
 
-                # タイム・上がり
                 agari = ""
                 for p in p_lines:
                     if "3F" in p.get_text():
                          am = re.search(r"3F\s*([\d\.]+)\((\d+)\)", p.get_text())
                          if am: agari = f"3F{am.group(2)}位"
 
-                # 通過順
                 pos_p = z.select_one("p.position")
                 pas = "-".join([s.get_text(strip=True) for s in pos_p.find_all("span")]) if pos_p else ""
                 
-                # -----------------------------------------------------
-                # 前走騎手Pの取得ロジック (i=1)
-                # -----------------------------------------------------
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 if i == 1:
                     first_prev_jockey_full = j_prev_full
-                    # 場所名が特定できていれば、その場所のP値を取得
                     if place_short in ["船橋", "大井", "川崎", "浦和"]:
                         p_data = resources["power_data"].get((place_short, j_prev_full))
                         if p_data:
                             prev_power_info = f"{p_data['power']}"
 
-                # 距離 (コース情報から)
-                dist = ""
-                # d_divの最後のspanにあることが多い、または別行
-                # 簡易的にテキスト全体からmを検索
                 z_text = z.get_text()
                 dm = re.search(r"(\d{3,4})m?", z_text)
-                if dm: dist = dm.group(1)
+                dist = dm.group(1) if dm else ""
 
                 h_str = f"{ymd} {place_short}{dist} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
@@ -359,23 +337,17 @@ def parse_nankankeiba_detail(html, place_name, resources):
             # 出力用P値文字列の作成
             curr_p = h['power']
             if prev_power_info and (j_full != first_prev_jockey_full):
-                # 乗り替わり かつ 前Pあり
-                # curr_p は "P:10" 形式なので、そのまま使用
+                # "前P:5" ではなく、数字のみがprev_power_infoに入っているので "前P:5" とフォーマット
                 power_line = f"【騎手】{curr_p}(前P:{prev_power_info})、 相性:{pair_stats}"
             else:
                 power_line = f"【騎手】{curr_p}、 相性:{pair_stats}"
 
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
-                "power": power_info, # P:xx
-                "compat": pair_stats, "hist": history
+                "power": power_info, 
+                "compat": pair_stats, "hist": history,
+                "display_power": power_line
             }
-            # 上書きでpower_lineを注入したいが、辞書構造を変えないため
-            # horse_texts 生成時にこのロジックを使う必要がある
-            # ここでは一時的に power_info を書き換える手もあるが、
-            # run_races_iter で再構築するのが安全。
-            # データ受け渡し用に拡張
-            data["horses"][umaban]["display_power"] = power_line
 
         except Exception: continue
     return data
@@ -505,7 +477,22 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 result_url = f"https://www.nankankeiba.com/result/{nk_id}.do"
                 
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
+                
+                # ▼▼▼【重要】データ取得の待機処理とタブ切り替え ▼▼▼
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
+                try:
+                    # 1. まずテーブルが表示されるまで待つ
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "shosai_aria"))
+                    )
+                    # 2. 念のため「詳細」タブをJSでクリック（基本タブになっている場合への対策）
+                    driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
+                    time.sleep(1) # クリック後の描画待ち
+                except TimeoutException:
+                    yield {"type": "error", "data": f"{r_num}R タイムアウト（データ取得失敗）"}
+                    continue
+                # ▲▲▲▲▲▲
+                
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
                 
                 if not nk_data["horses"]:
@@ -520,7 +507,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                     # 生成済みの power_line を使用
                     power_line = h.get("display_power", h['power'])
                     
-                    # 旧ロジックの p_info は削除し、power_line で完結させる
                     block = [
                         f"[{u}]{h['name']} 騎:{h['jockey']} 師:{h['trainer']}",
                         f"話:{danwa.get(u,'なし')}", 
