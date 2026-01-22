@@ -404,15 +404,22 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         break
 
                 # ==================================================
-                # ★ 5. 上がり3F (修正箇所)
+                # ★ 5. 上がり3F (修正版：スペースがあってもなくても取得可能)
                 # ==================================================
-                # HTML構造: <span class="furlongtime">3F 39.4(8)</span>
-                # 直接クラス指定で取得します
                 agari = ""
+                # .furlongtime クラスをピンポイントで取得
                 ft_elem = z.select_one(".furlongtime")
+                
                 if ft_elem:
-                    # 例: "3F 39.4(8)" そのまま取得
-                    agari = ft_elem.get_text(strip=True)
+                    # テキストをそのまま取得
+                    # "3F 39.3" でも "3F 39.3(2)" でも、そのまま agari に格納されます
+                    raw_agari = ft_elem.get_text(strip=True)
+                    
+                    # 空文字でなければ採用
+                    if raw_agari:
+                        agari = raw_agari
+
+                # ==================================================
                 
                 # ==================================================
 
