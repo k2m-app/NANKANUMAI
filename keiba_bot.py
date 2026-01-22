@@ -230,8 +230,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
     table = soup.select_one("#shosai_aria table.nk23_c-table22__table")
     if not table: return data
     
-    # 開催地マッピング補正
-    PLACE_MAP = {"船":"船橋", "大":"大井", "川":"川崎", "浦":"浦和"}
+    PLACE_MAP = {"船":"船橋", "大":"大井", "川":"川崎", "浦":"浦和", "門":"門別"}
 
     for row in table.select("tbody tr"):
         try:
@@ -249,7 +248,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if len(links) >= 1: j_raw = links[0].get_text(strip=True)
                 if len(links) >= 2: t_raw = links[1].get_text(strip=True)
             
-            # 今回騎手
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
             power_info = resources["power"].get((place_name, j_full), "P:不明")
@@ -263,115 +261,122 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
             
             history = []
-            prev_power_info = "" # "P:5" (前回のP)
-            first_prev_jockey_full = "" # 1走前騎手名(正規化後)
+            prev_power_info = ""
+            first_prev_jockey_full = ""
             
+            # HTML構造に基づく過去走解析
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z: continue
-                z_full_text = z.get_text(" ", strip=True)
-                if not z_full_text: continue
+                # 空セルチェック
+                if not z.get_text(strip=True): continue
 
                 d_txt = ""
-                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
-                if d_spans:
-                    for s in d_spans:
-                        if re.search(r"\d+\.\d+\.\d+", s.get_text()): 
-                            d_txt = s.get_text(strip=True); break
-                if not d_txt:
-                    m_dt = re.search(r"\d+\.\d+\.\d+", z_full_text)
-                    if m_dt: d_txt = m_dt.group(0)
+                # 日付：<span class="nk23_u-text10">船橋25.12.11</span> のような構造
+                d_div = z.select_one("p.nk23_u-d-flex")
+                if d_div:
+                    # テキスト全体から日付を探す
+                    d_full = d_div.get_text(strip=True)
+                    # "船橋25.12.11" -> "25.12.11"
+                    m_dt = re.search(r"(\d+\.\d+\.\d+)", d_full)
+                    if m_dt: d_txt = m_dt.group(1)
 
-                ymd, place_short = "", ""
-                m = re.match(r"([^\d]*?)(\d+)\.(\d+)\.(\d+)", d_txt)
-                if m:
-                    # 開催地の特定（略称を正式名称へ）
-                    raw_p = m.group(1).strip()
-                    # 日付の横に場所がない場合は、コース名などから推測
-                    if not raw_p:
-                        cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
-                        if "船" in cond_txt: raw_p = "船橋"
-                        elif "大" in cond_txt: raw_p = "大井"
-                        elif "川" in cond_txt: raw_p = "川崎"
-                        elif "浦" in cond_txt: raw_p = "浦和"
-                        else: raw_p = place_name
-                    
-                    place_short = PLACE_MAP.get(raw_p, raw_p) # "船" -> "船橋"
-                    ymd = f"{m.group(2)}/{int(m.group(3))}/{int(m.group(4))}"
-                else:
-                    place_short = place_name # default
+                # 開催地の特定
+                place_short = place_name
+                if d_div:
+                     # 開催地名は日付の前にあることが多い
+                     p_match = re.search(r"([^\d]+)\d+\.\d+\.\d+", d_div.get_text(strip=True))
+                     if p_match:
+                         raw_p = p_match.group(1).strip()
+                         place_short = PLACE_MAP.get(raw_p, raw_p)
 
-                cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
-                if not cond_txt:
-                    m_dist = re.search(r"(ダ|芝)?\d{4}m?", z_full_text)
-                    if m_dist: cond_txt = m_dist.group(0)
+                ymd = d_txt if d_txt else "不明"
                 
-                dist_m = re.search(r"\d{4}", cond_txt)
-                dist = dist_m.group(0) if dist_m else ""
-                course_s = f"{place_short}{dist}"
-
+                # レース名
                 r_a = z.select_one("a.is-link")
-                r_ti = r_a.get("title", "") if r_a else ""
-                rp = re.split(r'[ 　]+', r_ti)
-                r_cl = rp[1] if len(rp)>1 else ""
+                r_cl = r_a.get_text(strip=True) if r_a else ""
                 
+                # 着順
                 rank = ""
                 r_tag = z.select_one(".nk23_u-text19")
                 if r_tag: rank = r_tag.get_text(strip=True).replace("着","")
-                if not rank:
-                    m_rnk = re.search(r'(\d{1,2})着', z_full_text)
-                    if m_rnk: rank = m_rnk.group(1)
 
-                pos_p = z.select_one("p.position")
-                pas = "-".join([s.get_text(strip=True) for s in pos_p.find_all("span")]) if pos_p else ""
-                if not pas:
-                    m_pas = re.search(r'(\d{1,2}-\d{1,2}(?:-\d{1,2})*)', z_full_text)
-                    if m_pas: pas = m_pas.group(1)
-
-                j_prev, pop, agari = "", "", ""
+                # 人気・騎手・斤量
+                # 構造: <p class="nk23_u-text10"><span class="popularity">...</span><span>濱田達56.0</span></p>
+                j_prev, pop = "", ""
                 p_lines = z.select("p.nk23_u-text10")
                 for p in p_lines:
-                    pt = p.get_text(strip=True)
-                    if "人気" in pt:
-                        pm = re.search(r"(\d+)人気", pt)
-                        if pm: pop = f"{pm.group(1)}人"
-                        sps = p.find_all("span")
-                        if len(sps) > 1: j_prev = sps[1].get_text(strip=True)
-                    if "3F" in pt:
-                        am = re.search(r"\(([\d]+)\)", pt)
-                        if am: agari = f"3F{am.group(1)}位"
+                    # <span>が2つある行を探す
+                    spans = p.find_all("span")
+                    if len(spans) >= 2:
+                        # 1つ目が人気を含むかチェック
+                        if "人気" in spans[0].get_text():
+                            pop_text = spans[0].get_text(strip=True)
+                            pm = re.search(r"(\d+)人気", pop_text)
+                            if pm: pop = f"{pm.group(1)}人"
+                            
+                            # 2つ目が騎手+斤量 "濱田達56.0"
+                            j_raw_text = spans[1].get_text(strip=True)
+                            # 数字の前までを騎手名とする
+                            jm = re.match(r"([^\d]+)", j_raw_text)
+                            if jm: j_prev = jm.group(1).strip()
+                            break
 
-                if not pop:
-                    m_pop = re.search(r'(\d+)人', z_full_text)
-                    if m_pop: pop = f"{m_pop.group(1)}人"
-                if not agari:
-                    m_ag = re.search(r'3F(\d+)位?', z_full_text)
-                    if m_ag: agari = f"3F{m_ag.group(1)}位"
-                if not j_prev:
-                    m_j = re.search(r'([^\s\d]+?)\s*\d{2}\.\d', z_full_text)
-                    if m_j: j_prev = m_j.group(1)
+                # タイム・上がり
+                agari = ""
+                for p in p_lines:
+                    if "3F" in p.get_text():
+                         am = re.search(r"3F\s*([\d\.]+)\((\d+)\)", p.get_text())
+                         if am: agari = f"3F{am.group(2)}位"
 
-                # 前走騎手の正規化
-                j_prev_full = normalize_name(j_prev, resources["jockeys"])
+                # 通過順
+                pos_p = z.select_one("p.position")
+                pas = "-".join([s.get_text(strip=True) for s in pos_p.find_all("span")]) if pos_p else ""
                 
-                # 1走前 (i=1) のデータを取得
+                # -----------------------------------------------------
+                # 前走騎手Pの取得ロジック (i=1)
+                # -----------------------------------------------------
+                j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 if i == 1:
                     first_prev_jockey_full = j_prev_full
-                    # マッピング済みの place_short を使ってP値取得
-                    p_data = resources["power_data"].get((place_short, j_prev_full))
-                    if p_data:
-                        prev_power_info = f"{p_data['power']}"
+                    # 場所名が特定できていれば、その場所のP値を取得
+                    if place_short in ["船橋", "大井", "川崎", "浦和"]:
+                        p_data = resources["power_data"].get((place_short, j_prev_full))
+                        if p_data:
+                            prev_power_info = f"{p_data['power']}"
 
-                h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
+                # 距離 (コース情報から)
+                dist = ""
+                # d_divの最後のspanにあることが多い、または別行
+                # 簡易的にテキスト全体からmを検索
+                z_text = z.get_text()
+                dm = re.search(r"(\d{3,4})m?", z_text)
+                if dm: dist = dm.group(1)
+
+                h_str = f"{ymd} {place_short}{dist} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
-                
+            
+            # 出力用P値文字列の作成
+            curr_p = h['power']
+            if prev_power_info and (j_full != first_prev_jockey_full):
+                # 乗り替わり かつ 前Pあり
+                # curr_p は "P:10" 形式なので、そのまま使用
+                power_line = f"【騎手】{curr_p}(前P:{prev_power_info})、 相性:{pair_stats}"
+            else:
+                power_line = f"【騎手】{curr_p}、 相性:{pair_stats}"
+
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
-                "power": power_info, 
-                "prev_power_val": prev_power_info, # "5" (数字のみ)
-                "first_prev_jockey": first_prev_jockey_full, # 1走前騎手(正規化)
+                "power": power_info, # P:xx
                 "compat": pair_stats, "hist": history
             }
+            # 上書きでpower_lineを注入したいが、辞書構造を変えないため
+            # horse_texts 生成時にこのロジックを使う必要がある
+            # ここでは一時的に power_info を書き換える手もあるが、
+            # run_races_iter で再構築するのが安全。
+            # データ受け渡し用に拡張
+            data["horses"][umaban]["display_power"] = power_line
+
         except Exception: continue
     return data
 
@@ -457,7 +462,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
         return f"(対戦表取得エラー: {e})"
 
 # ==================================================
-# 5. ジェネレータ (モード分岐対応)
+# 5. ジェネレータ
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
     resources = load_resources()
@@ -512,21 +517,12 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
                     
-                    # 騎手情報構築 (p_infoは廃止し、power_lineに統合)
-                    curr_p = h['power'] 
-                    prev_p_val = h['prev_power_val']
+                    # 生成済みの power_line を使用
+                    power_line = h.get("display_power", h['power'])
                     
-                    # 乗り替わり判定: 名前が違う場合
-                    is_change = (h['jockey'] != h['first_prev_jockey'])
-                    
-                    # ロジック: 乗り替わりかつ前Pがあれば表示、なければ表示しない
-                    if is_change and prev_p_val:
-                        power_line = f"【騎手】{curr_p}(前P:{prev_p_val})、 相性:{h['compat']}"
-                    else:
-                        power_line = f"【騎手】{curr_p}、 相性:{h['compat']}"
-
+                    # 旧ロジックの p_info は削除し、power_line で完結させる
                     block = [
-                        f"[{u}]{h['name']} 騎:{h['jockey']} 師:{h['trainer']}", # p_info削除
+                        f"[{u}]{h['name']} 騎:{h['jockey']} 師:{h['trainer']}",
                         f"話:{danwa.get(u,'なし')}", 
                         f"調:{cyokyo.get(u,'データなし')}",
                         power_line,
@@ -538,7 +534,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
                 
-                # --- Raw モード ---
                 if mode == "raw":
                     yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
                     match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
@@ -547,17 +542,14 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                     time.sleep(1)
                     continue
 
-                # --- Dify モード ---
-                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中 (待機発生の可能性あり)..."}
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
                 ai_out = run_dify_prediction(full_prompt)
-                
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades)
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
                 final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
-                
                 yield {"type": "result", "race_num": r_num, "data": final_text}
                 time.sleep(15) 
 
