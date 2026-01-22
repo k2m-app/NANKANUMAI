@@ -802,7 +802,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 if mode == "raw":
                     yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
                     match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
-                    final_text = f"{full_prompt}\n\n{match_txt}\n\n詳細リンク: {result_url}"
                     yield {"type": "result", "race_num": r_num, "data": final_text}
                     time.sleep(1)
                     continue
