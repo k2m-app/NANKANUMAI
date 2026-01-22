@@ -122,96 +122,119 @@ def load_resources():
     res = {"jockeys": [], "trainers": [], "power_data": {}}
     
     # 1. マスタファイルから騎手・調教師リスト読み込み
-    if os.path.exists(JOCKEY_FILE):
-        try:
-            with open(JOCKEY_FILE, "r", encoding="utf-8-sig") as f:
-                res["jockeys"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
-        except: pass
-    
-    if os.path.exists(TRAINER_FILE):
-        try:
-            with open(TRAINER_FILE, "r", encoding="utf-8-sig") as f:
-                res["trainers"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
-        except: pass
+    # UTF-8でだめならShift-JISでトライ
+    for fpath, key in [(JOCKEY_FILE, "jockeys"), (TRAINER_FILE, "trainers")]:
+        if os.path.exists(fpath):
+            loaded = False
+            for enc in ["utf-8-sig", "cp932"]:
+                try:
+                    with open(fpath, "r", encoding=enc) as f:
+                        res[key] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
+                    loaded = True
+                    break
+                except: continue
 
-    # 2. 騎手パワーCSV読み込み (勝率・複勝率・パワー)
-    # 併せて騎手リストの補完も行う（正規化の精度向上のため）
+    # 2. 騎手パワーCSV読み込み
     if os.path.exists(POWER_FILE):
-        try:
-            df = pd.read_csv(POWER_FILE, encoding="utf-8-sig")
-            
-            # カラム特定 (1列目が場所、3列目が騎手名、他：勝率,複勝率,騎手パワー)
-            place_col = df.columns[0]
-            
-            # カラム存在チェック
-            has_win = '勝率' in df.columns
-            has_fuku = '複勝率' in df.columns
-            has_power = '騎手パワー' in df.columns
-            has_name = '騎手名' in df.columns
+        df = None
+        for enc in ["utf-8-sig", "cp932"]:
+            try:
+                df = pd.read_csv(POWER_FILE, encoding=enc)
+                break
+            except: continue
+        
+        if df is not None:
+            try:
+                # カラム特定
+                place_col = df.columns[0]
+                has_win = '勝率' in df.columns
+                has_fuku = '複勝率' in df.columns
+                has_power = '騎手パワー' in df.columns
+                has_name = '騎手名' in df.columns
 
-            csv_jockeys = set()
+                csv_jockeys = set()
 
-            for _, row in df.iterrows():
-                # 騎手名と場所がある行のみ処理
-                p = str(row[place_col]).strip()
-                j_raw = row['騎手名'] if has_name else ""
-                j = str(j_raw).replace(" ","").replace("　","")
-                
-                if not j or not p: continue
-
-                csv_jockeys.add(j)
-
-                # データ格納 (値がない場合はハイフン)
-                val_power = str(row['騎手パワー']) if has_power else '-'
-                val_win = str(row['勝率']) if has_win else '-'
-                val_fuku = str(row['複勝率']) if has_fuku else '-'
-
-                key_t = (p, j)
-                res["power_data"][key_t] = {
-                    "power": val_power,
-                    "win": val_win,
-                    "fuku": val_fuku
-                }
-            
-            # マスタになかった騎手名をリストに追加 (例: 新原周馬がマスタになくてもCSVにあれば追加)
-            current_jockeys = set(res["jockeys"])
-            for j in csv_jockeys:
-                if j not in current_jockeys:
-                    res["jockeys"].append(j)
+                for _, row in df.iterrows():
+                    p = str(row[place_col]).strip()
+                    j_raw = row['騎手名'] if has_name else ""
+                    j = str(j_raw).replace(" ","").replace("　","")
                     
-        except Exception as e:
-            pass
+                    if not j or not p: continue
+
+                    csv_jockeys.add(j)
+
+                    val_power = str(row['騎手パワー']) if has_power else '-'
+                    val_win = str(row['勝率']) if has_win else '-'
+                    val_fuku = str(row['複勝率']) if has_fuku else '-'
+
+                    key_t = (p, j)
+                    res["power_data"][key_t] = {
+                        "power": val_power,
+                        "win": val_win,
+                        "fuku": val_fuku
+                    }
+                
+                # マスタ補完
+                current_jockeys = set(res["jockeys"])
+                for j in csv_jockeys:
+                    if j not in current_jockeys:
+                        res["jockeys"].append(j)
+                        
+            except Exception as e:
+                pass
             
     return res
 
 def normalize_name(abbrev, full_list):
     """
     略称(abbrev)をフルネームリスト(full_list)から探して正規化する。
-    例: '新原周' -> '新原周馬'
     """
     if not abbrev: return ""
-    clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev) # 記号や数字を除去
+    clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
     if not clean: return ""
     if not full_list: return clean
     if clean in full_list: return clean
     
     candidates = []
     for full in full_list:
-        # 略称の全文字がフルネームに含まれているか確認
         if all(c in full for c in clean):
             candidates.append((len(full) - len(clean), full))
     
     if candidates:
-        # 文字数差が最も小さいものを採用
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
     return clean
+
+def resolve_jockey_name_context_aware(abbrev, place, resources):
+    """
+    通常の正規化に加え、該当競馬場のパワーデータに存在する騎手名から
+    文脈を考慮してフルネームを特定する。
+    例: 船橋で「川島正」-> パワーデータ('船橋','川島正太郎')があればそちらを優先
+    """
+    clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
+    if not clean: return ""
+
+    # 1. 該当競馬場のパワーデータキーから候補を探す (文脈優先)
+    candidates = []
+    for (p, j_full) in resources["power_data"].keys():
+        if p == place:
+            # 略称の全文字が含まれているか
+            if all(c in j_full for c in clean):
+                candidates.append(j_full)
+    
+    if candidates:
+        # 文字数差が小さい順
+        candidates.sort(key=lambda x: len(x) - len(clean))
+        return candidates[0]
+
+    # 2. 見つからなければ通常の全体リストからの正規化
+    return normalize_name(abbrev, resources["jockeys"])
+
 
 def parse_nankankeiba_detail(html, place_name, resources):
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
     
-    # --- レース情報取得 ---
     h3 = soup.find("h3", class_="nk23_c-tab1__title")
     data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else ""
     if data["meta"]["race_name"]:
@@ -226,13 +249,11 @@ def parse_nankankeiba_detail(html, place_name, resources):
     table = shosai_area.select_one("table.nk23_c-table22__table")
     if not table: return data
     
-    # 競馬場判定用マップ
     PLACE_MAP = {"船":"船橋", "大":"大井", "川":"川崎", "浦":"浦和", "門":"門別", "盛":"盛岡", "水":"水沢", "笠":"笠松", "名":"名古屋", "園":"園田", "姫":"姫路", "高":"高知", "佐":"佐賀"}
     KNOWN_PLACES = list(PLACE_MAP.values()) + ["JRA"]
 
     for row in table.select("tbody tr"):
         try:
-            # --- 馬番・馬名 ---
             u_tag = row.select_one("td.umaban") or row.select_one("td.is-col02")
             if not u_tag: continue
             umaban = u_tag.get_text(strip=True)
@@ -248,20 +269,19 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if len(links) >= 1: j_raw = links[0].get_text(strip=True)
                 if len(links) >= 2: t_raw = links[1].get_text(strip=True)
             
+            # 今回の騎手は全体リストから正規化
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
             
-            # --- 今回の騎手データ取得 (パワー, 勝率, 複勝率) ---
+            # --- 今回の騎手データ ---
             p_data_curr = resources["power_data"].get((place_name, j_full))
             curr_power_str = "P:不明"
             if p_data_curr:
-                # フォーマット: P:値(勝xx%複yy%)
                 cp = p_data_curr['power']
-                cw = p_data_curr['win'].replace('%','') # 二重%防止
+                cw = p_data_curr['win'].replace('%','') 
                 cf = p_data_curr['fuku'].replace('%','')
                 curr_power_str = f"P:{cp}(勝{cw}%複{cf}%)"
             
-            # --- 相性データ ---
             ai2 = row.select_one("td.cs-ai2 .graph_text_div")
             pair_stats = "-"
             if ai2 and "データ" not in ai2.get_text():
@@ -277,11 +297,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z: continue
-                # 全体テキスト
                 z_full_text = z.get_text(" ", strip=True)
                 if not z_full_text: continue
 
-                # 1. 日付と開催場の特定
+                # 1. 日付と開催場
                 d_txt = ""
                 place_short = ""
                 d_div = z.select_one("p.nk23_u-d-flex")
@@ -291,7 +310,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     m_dt = re.search(r"(\d+\.\d+\.\d+)", d_raw)
                     if m_dt: d_txt = m_dt.group(1)
                     
-                    # 競馬場名を抽出
                     rem_text = d_raw.replace(d_txt, "") if d_txt else d_raw
                     for kp in KNOWN_PLACES:
                         if kp in rem_text:
@@ -315,7 +333,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 r_tag = z.select_one(".nk23_u-text19")
                 if r_tag: rank = r_tag.get_text(strip=True).replace("着","")
 
-                # 4. 騎手・人気
+                # 4. 騎手(略称)・人気
                 j_prev, pop = "", ""
                 p_lines = z.select("p.nk23_u-text10")
                 for p in p_lines:
@@ -326,7 +344,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         spans = p.find_all("span")
                         if len(spans) >= 2:
                             j_cand = spans[1].get_text(strip=True)
-                            j_prev = re.sub(r"[\d\.]+", "", j_cand) # 斤量削除
+                            j_prev = re.sub(r"[\d\.]+", "", j_cand)
                         break
 
                 # 5. 上がり3F
@@ -344,19 +362,19 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     pas_spans = [s.get_text(strip=True) for s in pos_p.find_all("span")]
                     pas = "-".join(pas_spans)
                 
-                # 7. 騎手名正規化と前走P取得
-                # CSVからリスト補完しているので「新原周」→「新原周馬」への変換成功率アップ
-                j_prev_full = normalize_name(j_prev, resources["jockeys"])
+                # 7. 騎手名の解決 (文脈考慮: その開催場のパワーデータにある名前を優先)
+                # これにより「船橋」の「川島正」が「川島正太郎」に解決される
+                j_prev_full = resolve_jockey_name_context_aware(j_prev, place_short, resources)
                 if not j_prev_full and j_prev: j_prev_full = j_prev
 
-                # ★ 前走(i=1)の場合、CSVから騎手パワーを取得 ★
+                # ★ 前走(i=1)のP取得 ★
                 if i == 1:
                     p_key = (place_short, j_prev_full)
                     p_data_prev = resources["power_data"].get(p_key)
                     if p_data_prev:
                         prev_power_val = p_data_prev['power']
 
-                # --- 文字列生成 (レース名削除, フォーマット統一) ---
+                # --- 文字列生成 (解決済みフルネームを使用) ---
                 agari_part = f"({agari})" if agari else "()"
                 pop_part = f"({pop})" if pop else ""
                 rank_part = f"{rank}着" if rank else "着不明"
@@ -364,7 +382,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 h_str = f"{d_txt} {place_short}{dist} {j_prev_full} {pas}{agari_part}→{rank_part}{pop_part}"
                 history.append(h_str)
             
-            # --- 最終表示用文字列 ---
+            # --- 最終表示用 ---
             if prev_power_val:
                 power_line = f"【騎手】{curr_power_str}(前P:{prev_power_val})、 相性:{pair_stats}"
             else:
@@ -372,9 +390,9 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
-                "power": curr_power_str, # 個別データ用
+                "power": curr_power_str,
                 "compat": pair_stats, "hist": history,
-                "display_power": power_line # 表示用
+                "display_power": power_line
             }
 
         except Exception: continue
@@ -600,7 +618,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
                     
-                    # 生成済みの display_power を使用
                     power_line = h.get("display_power", f"【騎手】{h['power']}、 相性:{h['compat']}")
                     
                     block = [
