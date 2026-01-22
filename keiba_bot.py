@@ -141,18 +141,29 @@ def load_resources():
     return res
 
 def normalize_name(abbrev, full_list):
+    """
+    略称から正式名称を探す。
+    例: "川島正" -> "川島正太郎" (リストに正太郎しかない場合)
+    """
     if not abbrev: return ""
     clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
     if not clean: return ""
     if not full_list: return clean
     if clean in full_list: return clean
+    
     candidates = []
     for full in full_list:
+        # 略称の文字がすべて、順番通りに含まれているかチェック
+        # clean="川島正", full="川島正太郎" -> OK
         if all(c in full for c in clean):
-            candidates.append((len(full) - len(clean), full))
+            diff = len(full) - len(clean)
+            candidates.append((diff, full))
+            
     if candidates:
+        # 文字数差が小さい順にソート (最も近い名前を採用)
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
+        
     return clean
 
 def get_nankan_kai_nichi(month, day, place_name):
@@ -230,6 +241,12 @@ def parse_nankankeiba_detail(html, place_name, resources):
     table = soup.select_one("#shosai_aria table.nk23_c-table22__table")
     if not table: return data
     
+    # 開催地マッピング（スクレイピング結果の略称 -> CSVの正式名称）
+    PLACE_MAP = {
+        "船": "船橋", "大": "大井", "川": "川崎", "浦": "浦和",
+        "船橋": "船橋", "大井": "大井", "川崎": "川崎", "浦和": "浦和"
+    }
+
     for row in table.select("tbody tr"):
         try:
             u_tag = row.select_one("td.umaban") or row.select_one("td.is-col02")
@@ -245,6 +262,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 links = jg_td.select("a")
                 if len(links) >= 1: j_raw = links[0].get_text(strip=True)
                 if len(links) >= 2: t_raw = links[1].get_text(strip=True)
+            
+            # 今回騎手の正規化
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
             power_info = resources["power"].get((place_name, j_full), "P:不明")
@@ -258,8 +277,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
             
             history = []
-            prev_power_info = "" 
-            first_prev_jockey_full = "" # 1走前騎手名(正規化後)
+            prev_power_info = ""
+            first_prev_jockey_full = ""
             
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
@@ -277,11 +296,27 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     m_dt = re.search(r"\d+\.\d+\.\d+", z_full_text)
                     if m_dt: d_txt = m_dt.group(0)
 
-                ymd, place_short = "", ""
+                # 開催地の特定
+                place_short = ""
                 m = re.match(r"([^\d]*?)(\d+)\.(\d+)\.(\d+)", d_txt)
                 if m:
-                    place_short = m.group(1) or place_name[0]
+                    raw_place = m.group(1).strip()
+                    # 開催地名が空なら、現在の開催地と同じと仮定（または日付列の横にある）
+                    if not raw_place:
+                        # 他の要素から探す
+                        cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
+                        if "船橋" in cond_txt: raw_place = "船橋"
+                        elif "大井" in cond_txt: raw_place = "大井"
+                        elif "川崎" in cond_txt: raw_place = "川崎"
+                        elif "浦和" in cond_txt: raw_place = "浦和"
+                        else: raw_place = place_name # デフォルト
+                    
+                    # マッピングで正式名称に変換 ("船" -> "船橋")
+                    place_short = PLACE_MAP.get(raw_place, raw_place)
                     ymd = f"{m.group(2)}/{int(m.group(3))}/{int(m.group(4))}"
+                else:
+                    # 日付が取れない場合でも続行
+                    place_short = place_name
 
                 cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
                 if not cond_txt:
@@ -333,14 +368,15 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     m_j = re.search(r'([^\s\d]+?)\s*\d{2}\.\d', z_full_text)
                     if m_j: j_prev = m_j.group(1)
 
+                # 前走騎手の正規化とP値取得
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 
-                # 1走前データの保存 (確実に)
                 if i == 1:
                     first_prev_jockey_full = j_prev_full
+                    # マッピング済みの place_short を使用して検索
                     p_data = resources["power_data"].get((place_short, j_prev_full))
                     if p_data:
-                        prev_power_info = f"{p_data['power']}" # 数字だけ保持
+                        prev_power_info = f"{p_data['power']}"
 
                 h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
@@ -348,7 +384,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
                 "power": power_info, 
-                "prev_power_val": prev_power_info, # 数字のみ "5" とか
+                "prev_power_val": prev_power_info,
                 "first_prev_jockey": first_prev_jockey_full, 
                 "compat": pair_stats, "hist": history, 
                 "prev_jockey_name": history[0].split(" ")[3] if history else "" 
@@ -438,7 +474,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
         return f"(対戦表取得エラー: {e})"
 
 # ==================================================
-# 5. ジェネレータ (モード分岐対応・修正版)
+# 5. ジェネレータ
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
     resources = load_resources()
@@ -493,25 +529,17 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
                     
-                    # 騎手情報構築
-                    p_jockey = h.get("prev_jockey_name", "")
-                    p_info = f"(前:{p_jockey})" if p_jockey else ""
+                    curr_p = h['power'] 
+                    prev_p_val = h['prev_power_val']
                     
-                    curr_p = h['power'] # "P:5" 
-                    prev_p_val = h['prev_power_val'] # "3" (数字のみ)
-                    
-                    # ロジック: 今回と前回の騎手名が違う場合は必ず何かを表示する
+                    # 乗り替わり判定: 名前が違う場合
                     is_change = (h['jockey'] != h['first_prev_jockey'])
                     
-                    if is_change:
-                        if prev_p_val:
-                            # P値がある場合 -> P:5(前P:3)
-                            power_line = f"【騎手】{curr_p}(前P:{prev_p_val})、 相性:{h['compat']}"
-                        else:
-                            # P値がない場合 -> P:5(前:騎手名)
-                            power_line = f"【騎手】{curr_p}(前:{h['first_prev_jockey'] or '不明'})、 相性:{h['compat']}"
+                    if is_change and prev_p_val:
+                        # 乗り替わり & 前Pあり -> 表示
+                        power_line = f"【騎手】{curr_p}(前P:{prev_p_val})、 相性:{h['compat']}"
                     else:
-                        # 継続騎乗
+                        # 継続 or 前Pなし -> 通常表示
                         power_line = f"【騎手】{curr_p}、 相性:{h['compat']}"
 
                     block = [
