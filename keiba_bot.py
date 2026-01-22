@@ -13,7 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 
 # HTML Parsing & Network
 from bs4 import BeautifulSoup
@@ -221,19 +221,21 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
 def parse_nankankeiba_detail(html, place_name, resources):
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
+    h3 = soup.find("h3", class_="nk23_c-tab1__title")
+    data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else ""
+    if data["meta"]["race_name"]:
+        parts = re.split(r'[ 　]+', data["meta"]["race_name"])
+        data["meta"]["grade"] = parts[-1] if len(parts) > 1 else ""
+    cond = soup.select_one("a.nk23_c-tab1__subtitle__text.is-blue")
+    data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
     
-    # 待機処理後に取得したHTMLなのでテーブルは存在するはずだが念のため
     shosai_area = soup.select_one("#shosai_aria")
     if not shosai_area: return data
     
     table = shosai_area.select_one("table.nk23_c-table22__table")
     if not table: return data
     
-    # 開催地マッピング（略称→正式名称）
-    PLACE_MAP = {
-        "船": "船橋", "大": "大井", "川": "川崎", "浦": "浦和", "門": "門別",
-        "船橋": "船橋", "大井": "大井", "川崎": "川崎", "浦和": "浦和"
-    }
+    PLACE_MAP = {"船":"船橋", "大":"大井", "川":"川崎", "浦":"浦和", "門":"門別"}
 
     for row in table.select("tbody tr"):
         try:
@@ -268,7 +270,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             prev_power_info = "" 
             first_prev_jockey_full = "" 
             
-            # 過去3走の解析
+            # 過去3走 (cs-z1, cs-z2, cs-z3)
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z: continue
@@ -287,7 +289,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         place_short = PLACE_MAP.get(raw_p, raw_p) # マッピング適用
                     ymd = f"{m_dt.group(2)}/{int(m_dt.group(3))}/{int(m_dt.group(4))}"
                 
-                # レース名 (取得しない)
+                # レース名は削除（取得しない）
                 
                 # 着順
                 rank = ""
@@ -297,7 +299,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                      m_rnk = re.search(r'(\d{1,2})着', z_full_text)
                      if m_rnk: rank = m_rnk.group(1)
 
-                # 人気・騎手
+                # 人気・騎手・斤量
                 j_prev, pop = "", ""
                 p_lines = z.select("p.nk23_u-text10")
                 for p in p_lines:
@@ -305,7 +307,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if "人気" in pt:
                         pm = re.search(r"(\d+)人気", pt)
                         if pm: pop = f"{pm.group(1)}人"
-                        # 騎手名抽出
+                        # 騎手名抽出（数字の前にある漢字/カナ）
                         jm = re.search(r"([^\s\d]+?)(\d{2}\.\d)", pt)
                         if jm: 
                              candidate = jm.group(1).strip()
@@ -317,7 +319,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
                 # 3F上がり順位の抽出 (カッコ内の数字)
                 agari = ""
-                # テキスト全体から探す (3F 39.5(1) -> 1位)
                 m_ag = re.search(r"3F\s*[\d\.]+\((\d+)\)", z_full_text)
                 if m_ag:
                     agari = f"3F{m_ag.group(1)}位"
@@ -490,30 +491,27 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
                 
+                # ▼▼▼【最強の待機処理】▼▼▼
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 try:
+                    # 強制詳細切り替え
                     driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                    WebDriverWait(driver, 10).until(
-                        EC.visibility_of_element_located((By.ID, "shosai_aria"))
+                    
+                    # 確実に詳細エリアの「過去走セル(.cs-z1)」が出るまで待つ (最大20秒)
+                    # これで「テーブルはあるけどデータが空」を防ぐ
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "td.cs-z1 p"))
                     )
-                    time.sleep(1.0)
+                    time.sleep(0.5)
                 except TimeoutException:
                     yield {"type": "error", "data": f"{r_num}R 詳細データ読み込みタイムアウト"}
                     continue
+                # ▲▲▲▲▲▲
                 
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
                 
                 if not nk_data["horses"]:
-                    # リトライ
-                    for _ in range(2):
-                        time.sleep(1)
-                        driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                        time.sleep(1)
-                        nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
-                        if nk_data["horses"]: break
-
-                if not nk_data["horses"]:
-                    yield {"type": "error", "data": f"{r_num}R データなし (HTML解析失敗)"}
+                    yield {"type": "error", "data": f"{r_num}R データなし"}
                     continue
 
                 header = f"レース名:{r_num}R {nk_data['meta'].get('race_name','')} 格:{nk_data['meta'].get('grade','')} コース:{nk_data['meta'].get('course','')}"
