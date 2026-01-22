@@ -404,23 +404,16 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         break
 
                 # ==================================================
-                # ★ 5. 上がり3F (修正版：スペースがあってもなくても取得可能)
+                # ★ 5. 上がり3F (ここを修正＆古いコードを完全削除)
                 # ==================================================
                 agari = ""
-                # .furlongtime クラスをピンポイントで取得
                 ft_elem = z.select_one(".furlongtime")
                 
                 if ft_elem:
-                    # テキストをそのまま取得
-                    # "3F 39.3" でも "3F 39.3(2)" でも、そのまま agari に格納されます
+                    # テキストをそのまま取得 ("3F 39.3" 等)
                     raw_agari = ft_elem.get_text(strip=True)
-                    
-                    # 空文字でなければ採用
                     if raw_agari:
                         agari = raw_agari
-
-                # ==================================================
-                
                 # ==================================================
 
                 # 6. 通過順
@@ -443,13 +436,13 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         prev_power_val = p_data_prev["power"]
 
                 # --- 文字列生成 ---
+                # agariには既に "3F 39.3" と入っているので、そのままカッコで囲む
                 agari_part = f"({agari})" if agari else "()"
                 pop_part = f"({pop})" if pop else ""
                 rank_part = f"{rank}着" if rank else "着不明"
 
                 h_str = f"{d_txt} {place_short}{dist} {j_prev_full} {pas}{agari_part}→{rank_part}{pop_part}"
                 history.append(h_str)
-
             # --- 最終表示用 ---
             if prev_power_val:
                 power_line = f"【騎手】{curr_power_str}(前P:{prev_power_val})、 相性:{pair_stats}"
