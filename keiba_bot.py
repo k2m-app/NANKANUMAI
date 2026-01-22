@@ -5,6 +5,7 @@ import json
 import requests
 import streamlit as st
 import pandas as pd
+import traceback  # ★エラー詳細追跡用
 
 # Selenium
 from selenium import webdriver
@@ -12,7 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 
 # HTML Parsing & Network
 from bs4 import BeautifulSoup
@@ -27,7 +28,7 @@ JOCKEY_FILE = os.path.join(DATA_DIR, "2025_NARJockey.csv")
 TRAINER_FILE = os.path.join(DATA_DIR, "2025_NankanTrainer.csv")
 POWER_FILE = os.path.join(DATA_DIR, "2025_騎手パワー.csv")
 
-# Secrets
+# Secrets (Streamlit Cloud対策でgetを使用)
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
@@ -52,21 +53,22 @@ def get_http_session() -> requests.Session:
 
 def get_driver():
     ops = Options()
+    # ヘッドレスモード設定（newモード推奨）
     ops.add_argument("--headless=new")
     ops.add_argument("--no-sandbox")
     ops.add_argument("--disable-dev-shm-usage")
     ops.add_argument("--disable-gpu")
-    ops.add_argument("--window-size=1920,2200")
+    ops.add_argument("--window-size=1920,1080")
     ops.add_argument("--lang=ja-JP")
     ops.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # ★重要: 画像読み込みなどでdriver.getがブロックされるのを防ぐ
-    ops.page_load_strategy = 'eager' 
+    # ★安定性重視のため eager は削除し、デフォルト(normal)を使用
+    # ops.page_load_strategy = 'eager' 
     
-    # 画像ロード抑制
+    # 画像ロード抑制（通信量削減と高速化）
     ops.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
     
-    # 自動操作フラグ隠蔽（Bot検知回避）
+    # Bot検知回避
     ops.add_argument("--disable-blink-features=AutomationControlled")
     
     return webdriver.Chrome(options=ops)
@@ -77,19 +79,29 @@ def login_keibabook_robust(driver):
     """
     try:
         driver.get("https://s.keibabook.co.jp/login/login")
+        # 既にログイン済みかチェック
         time.sleep(1)
         if "logout" in driver.current_url or driver.find_elements(By.XPATH, "//a[contains(@href,'logout')]"):
             return True
 
-        # 待機時間を少し長めに
-        WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
-        driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
+        # 要素が出るまで待機
+        wait = WebDriverWait(driver, 10)
+        id_input = wait.until(EC.visibility_of_element_located((By.NAME, "login_id")))
+        id_input.clear()
+        id_input.send_keys(KEIBA_ID)
         
+        pass_input = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+        pass_input.clear()
+        pass_input.send_keys(KEIBA_PASS)
+        
+        # クリック動作をJSで確実に行う
         submit = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
-        driver.execute_script("arguments[0].click();", submit) # JSクリックで確実性を向上
-        time.sleep(3)
+        driver.execute_script("arguments[0].click();", submit)
+        
+        time.sleep(2)
         return True
     except Exception:
+        # ログイン失敗しても他サイト（南関）の処理は止めない
         return False
 
 
@@ -166,11 +178,11 @@ def load_resources():
     if os.path.exists(POWER_FILE):
         try:
             df = pd.read_csv(POWER_FILE, encoding="utf-8-sig")
+            # 列名の揺らぎに対応（1列目を場所、騎手名を探索）
             place_col = df.columns[0]
             jockey_col = "騎手名"
-            power_col = "騎手パワー"
-            win_col = "勝率"
-            fuku_col = "複勝率"
+            if jockey_col not in df.columns and len(df.columns) > 2:
+                jockey_col = df.columns[2] # C列相当
 
             for _, row in df.iterrows():
                 place = str(row.get(place_col, "")).strip()
@@ -178,9 +190,9 @@ def load_resources():
                 if not place or not jockey:
                     continue
 
-                power = str(row.get(power_col, "")).strip()
-                win = str(row.get(win_col, "")).strip()
-                fuku = str(row.get(fuku_col, "")).strip()
+                power = str(row.get("騎手パワー", "")).strip()
+                win = str(row.get("勝率", "")).strip()
+                fuku = str(row.get("複勝率", "")).strip()
 
                 key_t = (place, jockey)
                 res["power"][key_t] = f"P:{power}" if power else "P:不明"
@@ -200,6 +212,7 @@ def normalize_name(abbrev, full_list):
     if not clean: return ""
     if not full_list: return clean
     if clean in full_list: return clean
+    # 部分一致探索
     candidates = []
     for full in full_list:
         if all(c in full for c in clean):
@@ -239,9 +252,10 @@ def get_kb_url_id(year, month, day, place_code, nichi, race_num):
 
 def parse_kb_danwa_cyokyo(driver, kb_id):
     d_danwa, d_cyokyo = {}, {}
-    # タイムアウトで落ちないようにtry-exceptで囲む
     try:
+        # 談話
         driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
+        # ログイン画面に飛ばされたら再ログインを試みる
         if "login" in driver.current_url:
             if login_keibabook_robust(driver):
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
@@ -261,6 +275,7 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                     d_danwa[curr] = m.group(1).strip() if m else raw_text
                     curr = None
 
+        # 調教
         driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tbl in soup.select("table.cyokyo"):
@@ -270,14 +285,19 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
             u_td = r1.select_one("td.umaban")
             if not u_td: continue
             uma = u_td.get_text(strip=True)
-            tp_txt = r1.select_one("td.tanpyo").get_text(strip=True) if r1.select_one("td.tanpyo") else ""
+            
+            tanpyo = r1.select_one("td.tanpyo")
+            tp_txt = tanpyo.get_text(strip=True) if tanpyo else ""
+            
             dt_txt = ""
             if len(rows) > 1:
                 dt_raw = rows[1].get_text(" ", strip=True)
                 dt_txt = re.sub(r"\s+", " ", dt_raw)
             d_cyokyo[uma] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
+            
     except Exception:
-        pass # KBデータ取得失敗は無視して続行
+        # 競馬ブック取得失敗は致命的ではないのでスルー
+        pass
     return d_danwa, d_cyokyo
 
 
@@ -304,9 +324,9 @@ def _format_rate(val) -> str:
     s = str(val).strip()
     if not s or s in ("-", "nan", "NaN", "None"): return ""
     if "%" in s:
-        m = re.search(r"([\d\.]+)", s)
-        if not m: return s
-        try: return f"{round(float(m.group(1)))}%"
+        try:
+            m = re.search(r"([\d\.]+)", s)
+            return f"{round(float(m.group(1)))}%" if m else s
         except: return s
     try:
         x = float(s)
@@ -316,82 +336,66 @@ def _format_rate(val) -> str:
 
 def _parse_date_place(text, fallback_place):
     s = re.sub(r"\s+", " ", (text or "")).strip()
+    # "川 23.10.12" 形式
     m = re.search(r"([^\d]{0,12})\s*(\d{2,4})\.(\d{1,2})\.(\d{1,2})", s)
     if m:
         raw_p = (m.group(1) or "").strip()
         y = int(m.group(2))
         if y < 100: y = 2000 + y
-        mm = int(m.group(3))
-        dd = int(m.group(4))
-        return _normalize_place_token(raw_p, fallback_place), f"{y}/{mm}/{dd}"
+        return _normalize_place_token(raw_p, fallback_place), f"{y}/{m.group(3)}/{m.group(4)}"
     
+    # "2023/10/12" 形式
     m = re.search(r"([^\d]{0,12})\s*(\d{4})/(\d{1,2})/(\d{1,2})", s)
     if m:
         raw_p = (m.group(1) or "").strip()
         return _normalize_place_token(raw_p, fallback_place), f"{m.group(2)}/{m.group(3)}/{m.group(4)}"
     return fallback_place, "不明"
 
-def _parse_dist(text):
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"(?:ダート|ダ|芝)\s*([0-9]{3,4})", s)
-    if m: return m.group(1)
-    ms = re.findall(r"([0-9]{3,4})\s*m", s)
-    if ms: return ms[-1]
-    return ""
-
-def _parse_rank(text):
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"(\d{1,2})\s*着", s)
-    return m.group(1) if m else ""
-
-def _parse_popularity(text):
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"(\d+)\s*人気", s)
-    return f"{m.group(1)}人" if m else ""
-
-def _parse_jockey_from_pop_line(text):
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"\d+\s*人気.*?([^\s\d]{1,8})\s*(\d{2}\.\d)", s)
-    if m: return m.group(1).strip()
-    m = re.search(r"([^\s\d]{1,8})\s*(\d{2}\.\d)", s)
-    if m: return m.group(1).strip()
-    return ""
-
-def _parse_agari(text):
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"3F\s*[\d\.]+\s*\((\d+)\)", s)
-    return f"3F{m.group(1)}位" if m else ""
-
-def _parse_passing(z_cell):
-    pos_p = z_cell.select_one("p.position") if z_cell else None
-    if pos_p:
-        spans = [s.get_text(strip=True) for s in pos_p.find_all("span")]
-        spans = [x for x in spans if x]
-        if spans: return "-".join(spans)
-    s = z_cell.get_text(" ", strip=True) if z_cell else ""
-    m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})*)", s)
-    return m.group(1) if m else ""
-
 def _parse_one_history(z_cell, fallback_place, resources):
-    z_text = z_cell.get_text(" ", strip=True) if z_cell else ""
+    """
+    セルごとの解析処理（安全策強化版）
+    """
+    if not z_cell:
+        return {"place": "", "ymd": "", "dist": "", "rank": "", "pop": "", "agari": "", "pas": "", "jockey_full": "", "raw": ""}
+        
+    z_text = z_cell.get_text(" ", strip=True)
     place, ymd = _parse_date_place(z_text, fallback_place)
-    dist = _parse_dist(z_text)
-    rank = _parse_rank(z_text)
-    pop = _parse_popularity(z_text)
-    agari = _parse_agari(z_text)
-    pas = _parse_passing(z_cell)
+    
+    # 距離
+    m_dist = re.search(r"(?:ダ|芝)\s*([0-9]{3,4})", z_text) or re.search(r"([0-9]{3,4})m", z_text)
+    dist = m_dist.group(1) if m_dist else ""
+    
+    # 着順
+    m_rank = re.search(r"(\d{1,2})\s*着", z_text)
+    rank = m_rank.group(1) if m_rank else ""
+    
+    # 人気
+    m_pop = re.search(r"(\d+)\s*人気", z_text)
+    pop = f"{m_pop.group(1)}人" if m_pop else ""
+    
+    # 上がり
+    m_agari = re.search(r"3F\s*[\d\.]+\s*\((\d+)\)", z_text)
+    agari = f"3F{m_agari.group(1)}位" if m_agari else ""
+    
+    # 通過順
+    pas = ""
+    pos_p = z_cell.select_one("p.position")
+    if pos_p:
+        spans = [s.get_text(strip=True) for s in pos_p.find_all("span") if s.get_text(strip=True)]
+        if spans: pas = "-".join(spans)
+    else:
+        m_pas = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})*)", z_text)
+        if m_pas: pas = m_pas.group(1)
 
+    # 騎手（人気行から抽出）
     j_prev = ""
     for p in z_cell.select("p.nk23_u-text10"):
         pt = p.get_text(" ", strip=True)
-        if "人気" in pt:
-            j_prev = _parse_jockey_from_pop_line(pt)
-            if j_prev: break
-    if not j_prev:
-        for p in z_cell.select("p.nk23_u-text10"):
-            pt = p.get_text(" ", strip=True)
-            j_prev = _parse_jockey_from_pop_line(pt)
-            if j_prev: break
+        # "2人気 吉原寛 56.0" のパターン
+        m = re.search(r"(?:\d+人気)?.*?([^\s\d]{1,8})\s*(\d{2}\.\d)", pt)
+        if m:
+            j_prev = m.group(1).strip()
+            break
 
     j_prev_full = normalize_name(j_prev, resources["jockeys"])
 
@@ -405,14 +409,17 @@ def parse_nankankeiba_detail(html, place_name, resources):
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
 
-    h3 = soup.find("h3", class_="nk23_c-tab1__title")
-    data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else ""
-    if data["meta"]["race_name"]:
-        parts = re.split(r"[ 　]+", data["meta"]["race_name"])
-        data["meta"]["grade"] = parts[-1] if len(parts) > 1 else ""
+    try:
+        h3 = soup.find("h3", class_="nk23_c-tab1__title")
+        data["meta"]["race_name"] = h3.get_text(strip=True) if h3 else ""
+        if data["meta"]["race_name"]:
+            parts = re.split(r"[ 　]+", data["meta"]["race_name"])
+            data["meta"]["grade"] = parts[-1] if len(parts) > 1 else ""
 
-    cond = soup.select_one("a.nk23_c-tab1__subtitle__text.is-blue")
-    data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
+        cond = soup.select_one("a.nk23_c-tab1__subtitle__text.is-blue")
+        data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
+    except:
+        pass
 
     shosai_area = soup.select_one("#shosai_aria")
     if not shosai_area: return data
@@ -421,14 +428,17 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
     for row in table.select("tbody tr"):
         try:
+            # 馬番
             u_tag = row.select_one("td.umaban") or row.select_one("td.is-col02")
             if not u_tag: continue
             umaban = u_tag.get_text(strip=True)
             if not umaban.isdigit(): continue
 
+            # 馬名
             h_link = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
             horse_name = h_link.get_text(strip=True) if h_link else "不明"
 
+            # 騎手・調教師
             jg_td = row.select_one("td.cs-g1")
             j_raw, t_raw = "", ""
             if jg_td:
@@ -439,14 +449,18 @@ def parse_nankankeiba_detail(html, place_name, resources):
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
 
+            # 相性
             ai2 = row.select_one("td.cs-ai2 .graph_text_div")
             pair_stats = "-"
             if ai2 and "データ" not in ai2.get_text():
-                r = ai2.select_one(".is-percent").get_text(strip=True) if ai2.select_one(".is-percent") else ""
-                w = ai2.select_one(".is-number").get_text(strip=True) if ai2.select_one(".is-number") else ""
-                tt = ai2.select_one(".is-total").get_text(strip=True) if ai2.select_one(".is-total") else ""
-                if r and w and tt: pair_stats = f"勝{r}({w}/{tt})"
+                try:
+                    r = ai2.select_one(".is-percent").get_text(strip=True) if ai2.select_one(".is-percent") else ""
+                    w = ai2.select_one(".is-number").get_text(strip=True) if ai2.select_one(".is-number") else ""
+                    tt = ai2.select_one(".is-total").get_text(strip=True) if ai2.select_one(".is-total") else ""
+                    if r and w and tt: pair_stats = f"勝{r}({w}/{tt})"
+                except: pass
 
+            # 過去走
             history_strs = []
             prev_power_val = ""
             prev_place = ""
@@ -457,6 +471,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if not z: continue
                 one = _parse_one_history(z, place_name, resources)
 
+                # 前走情報（1走目）
                 if i == 1:
                     prev_place = one["place"]
                     prev_jockey_full = one["jockey_full"]
@@ -464,8 +479,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if p_prev and str(p_prev.get("power", "")).strip():
                         prev_power_val = str(p_prev["power"]).strip()
 
-                ymd = (one["ymd"] or "").replace("着", "").strip()
-                pl = (one["place"] or "").replace("着", "").strip()
+                ymd = one["ymd"]
+                pl = one["place"]
                 dist = one["dist"]
                 jk = one["jockey_full"]
                 pas = one["pas"] or "-"
@@ -473,8 +488,11 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 rk = one["rank"] or ""
                 pop = one["pop"] or ""
                 ag_part = f"{ag}" if ag else ""
-                history_strs.append(f"{ymd} {pl}{dist} {jk} {pas}({ag_part})→{rk}着({pop})")
+                
+                if ymd: # 日付がある（＝走っている）場合のみ追加
+                    history_strs.append(f"{ymd} {pl}{dist} {jk} {pas}({ag_part})→{rk}着({pop})")
 
+            # 今回騎手パワー
             curr = resources["power_data"].get((place_name, j_full), {})
             curr_p = str(curr.get("power", "")).strip()
             curr_win = _format_rate(curr.get("win_rate"))
@@ -491,7 +509,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 "prev_place": prev_place, "prev_jockey_full": prev_jockey_full, "prev_power_val": prev_power_val,
             }
         except Exception:
+            # 個別の馬データのパース失敗はスキップして次へ
+            traceback.print_exc()
             continue
+            
     return data
 
 
@@ -511,15 +532,21 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
     try:
         driver.get(url)
-        # 対戦表は比較的軽いので明示的な待機
-        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CLASS_NAME, "nk23_c-table08__table")))
-        
+        wait = WebDriverWait(driver, 5)
+        # テーブルが出るか、データなしメッセージが出るまで待つ
+        try:
+            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "nk23_c-table08__table")))
+        except:
+            return "\n(対戦データなし)"
+
         soup = BeautifulSoup(driver.page_source, "html.parser")
         tbl = soup.find("table", class_="nk23_c-table08__table")
         if not tbl: return "\n(対戦データなし)"
 
         races = []
+        # ヘッダー解析
         if tbl.find("thead"):
+            # 先頭2列は馬情報なのでスキップ
             for col in tbl.find("thead").find_all(["th", "td"])[2:]:
                 det = col.find(class_="nk23_c-table08__detail")
                 if det:
@@ -535,11 +562,14 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
 
         if not races: return "\n(初対戦)"
 
+        # ボディ解析
         if tbl.find("tbody"):
             for tr in tbl.find("tbody").find_all("tr"):
                 u = tr.find("a", class_="nk23_c-table08__text")
                 if not u: continue
                 name = u.get_text(strip=True)
+                
+                # グレード紐付け
                 grade = grades.get(name, "")
                 if not grade:
                     for k, v in grades.items():
@@ -552,6 +582,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                     if c.find("a", class_="nk23_c-table08__text"): idx_st = i; break
                 if idx_st == -1: continue
 
+                # 各レースの結果
                 for i, c in enumerate(cells[idx_st + 1:]):
                     if i >= len(races): break
                     rp = c.find("p", class_="nk23_c-table08__number")
@@ -580,55 +611,50 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
 
 
 # ==================================================
-# 7. uma_shosai 遅延ロード対策（強化版）
+# 7. uma_shosai 遅延ロード対策（★最重要修正点）
 # ==================================================
 def _force_shosai_loaded(driver, timeout=30):
     """
-    ★強化版: 単にテキストがあるかだけでなく、データセルが複数埋まるのを待つ
+    JSによるデータロード完了を「要素の中身」で判定する鉄壁ロジック
     """
+    # 1. まずJSトリガーを確実に引く
     try:
-        # JSトリガーを明示的に
         driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-    except Exception:
-        pass
+    except: pass
 
-    end = time.time() + timeout
+    # 2. WebDriverWaitで「データが入ったセル」が出現するのを待つ
+    #    (td.cs-z1 内に文字が5文字以上入っている要素が1つでも見つかればOKとする)
+    wait = WebDriverWait(driver, timeout)
     
-    while time.time() < end:
+    def data_is_populated(d):
         try:
-            # 1. そもそもテーブルが表示されているか
-            rows = driver.find_elements(By.CSS_SELECTOR, "table.nk23_c-table22__table tbody tr")
-            if not rows:
-                time.sleep(0.5)
-                continue
+            # テーブルが存在するか
+            tbl = d.find_element(By.CSS_SELECTOR, "table.nk23_c-table22__table")
+            if not tbl: return False
+            
+            # 過去走データセル(cs-z1)を取得
+            cells = d.find_elements(By.CSS_SELECTOR, "td.cs-z1")
+            
+            # 「Loading...」ではなく、かつ空でもないセルがあるか確認
+            valid_cells = 0
+            for c in cells:
+                txt = c.text.strip()
+                if txt and "Loading" not in txt and len(txt) > 3:
+                    valid_cells += 1
+            
+            # 全頭が初出走のレースは稀だが、少なくとも1頭分あればロード完了とみなす
+            return valid_cells > 0
+        except:
+            return False
 
-            # 2. 過去走データのセルを取得
-            z1_cells = driver.find_elements(By.CSS_SELECTOR, "td.cs-z1")
-            
-            # データがあるセルをカウント
-            filled_count = 0
-            for cell in z1_cells:
-                txt = cell.text.strip()
-                # "Loading" や 空白 以外の有意なテキストがあるか
-                if txt and len(txt) > 5 and "Loading" not in txt:
-                    filled_count += 1
-            
-            # 半数以上の行でデータが埋まっていればOKとみなす
-            # (全頭出走経験ありとは限らないが、メインレースなどは概ね埋まる)
-            if filled_count >= 1: 
-                # 念のためもう一回だけ待ってDOMの安定を待つ
-                time.sleep(1.0)
-                return True
-            
-            # まだならスクロールで刺激
-            driver.execute_script("window.scrollBy(0, 300);")
-            
-        except Exception:
-            pass
-        
-        time.sleep(1.0) # ポーリング間隔
-
-    raise TimeoutException(f"詳細データの読み込みに失敗しました（timeout={timeout}s）")
+    try:
+        wait.until(data_is_populated)
+        time.sleep(0.5) # 念押しの安定待機
+        return True
+    except TimeoutException:
+        # 新馬戦などで全頭データがない場合もありうるので、エラーにはせずログだけ出す
+        print("Wait timeout or No history data found.")
+        return False
 
 
 # ==================================================
@@ -648,7 +674,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
         yield {"type": "status", "data": f"📅 開催特定中 ({place_name})..."}
         kai, nichi = get_nankan_kai_nichi(month, day, place_name)
         if not kai:
-            yield {"type": "error", "data": "開催特定失敗"}
+            yield {"type": "error", "data": "開催特定失敗（日付・場所を確認してください）"}
             return
         yield {"type": "status", "data": f"✅ {place_name} 第{kai}回 {nichi}日目"}
 
@@ -657,9 +683,14 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
 
         prog_url = f"https://www.nankankeiba.com/program/{year}{month}{day}{nk_place_code}.do"
         driver.get(prog_url)
-        # 一覧取得待ち
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "program_list")))
         
+        # プログラム一覧待ち
+        try:
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "program_list")))
+        except TimeoutException:
+            yield {"type": "error", "data": "レース一覧の取得にタイムアウトしました"}
+            return
+
         soup = BeautifulSoup(driver.page_source, "html.parser")
         r_nums = []
         for a in soup.find_all("a", href=True):
@@ -675,7 +706,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
 
             yield {"type": "status", "data": f"🏇 {r_num}R データ解析中..."}
             
-            # ★リトライループ：1レースごとの耐障害性を向上
+            # リトライ処理
             max_race_retries = 3
             success = False
             
@@ -687,23 +718,23 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
 
                     danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
 
-                    # uma_shosai へ移動
+                    # uma_shosai
                     shosai_url = f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do"
                     driver.get(shosai_url)
                     
-                    # 鬼門のロード待機
+                    # ロード待機
                     _force_shosai_loaded(driver, timeout=30)
 
                     nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
+                    
                     if not nk_data["horses"]:
-                        # データが空ならリトライ対象にするか、スキップするか
+                        # データが空ならリトライ
                         if attempt < max_race_retries - 1:
-                            print(f"Retry {r_num}R (empty data)...")
                             driver.refresh()
                             time.sleep(2)
                             continue
                         else:
-                            yield {"type": "error", "data": f"{r_num}R データなし(取得失敗)"}
+                            yield {"type": "error", "data": f"{r_num}R データ取得失敗(空データ)"}
                             break
 
                     header = (
@@ -748,26 +779,26 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
                         f"{match_txt}\n\n詳細リンク: {result_url}"
                     )
                     yield {"type": "result", "race_num": r_num, "data": final_text}
+                    
                     success = True
-                    time.sleep(5) # Dify負荷軽減
-                    break # ループ脱出
+                    time.sleep(5) 
+                    break 
 
-                except (TimeoutException, WebDriverException) as e:
+                except Exception as e:
+                    # エラーログ詳細表示
+                    traceback.print_exc()
                     if attempt < max_race_retries - 1:
-                        yield {"type": "status", "data": f"⚠️ {r_num}R タイムアウト発生。リトライ中({attempt+1}/{max_race_retries})..."}
-                        # ブラウザの状態がおかしいかもしれないので、一度ページをリセット
-                        try:
-                            driver.get("about:blank")
-                        except:
-                            pass
+                        yield {"type": "status", "data": f"⚠️ {r_num}R エラーによりリトライ({attempt+1}/{max_race_retries})..."}
+                        driver.delete_all_cookies() # クッキー削除でリセット試行
                         time.sleep(3)
                     else:
-                        yield {"type": "error", "data": f"{r_num}R 取得失敗: {e}"}
+                        yield {"type": "error", "data": f"{r_num}R 取得断念: {e}"}
 
     except Exception as e:
-        yield {"type": "error", "data": f"Fatal: {e}"}
+        traceback.print_exc()
+        yield {"type": "error", "data": f"Fatal Error: {e}"}
     finally:
         try:
             driver.quit()
-        except Exception:
+        except:
             pass
