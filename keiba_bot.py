@@ -218,6 +218,7 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
     return d_danwa, d_cyokyo
 
 def parse_nankankeiba_detail(html, place_name, resources):
+    """南関競馬の詳細データ解析（正規表現バックアップ付き）"""
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
     h3 = soup.find("h3", class_="nk23_c-tab1__title")
@@ -258,7 +259,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
             
             history = []
-            prev_power_info = ""
+            prev_power_info = "" # "前P:xx" という文字列
+            first_prev_jockey_full = "" # 1走前の騎手名(正規化後)
             
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
@@ -333,7 +335,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if m_j: j_prev = m_j.group(1)
 
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
+                
+                # 1走前（i==1）の場合のみ、P値と騎手名を保持
                 if i == 1:
+                    first_prev_jockey_full = j_prev_full
                     p_data = resources["power_data"].get((place_short, j_prev_full))
                     if p_data: prev_power_info = f"前P:{p_data['power']}"
 
@@ -342,9 +347,11 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
-                "power": power_info, "prev_power": prev_power_info,
+                "power": power_info, 
+                "prev_power": prev_power_info, # "前P:xx"
+                "first_prev_jockey": first_prev_jockey_full, # 1走前騎手名(正規化済)
                 "compat": pair_stats, "hist": history, 
-                "prev_jockey_name": history[0].split(" ")[3] if history else ""
+                "prev_jockey_name": history[0].split(" ")[3] if history else "" # backup
             }
         except Exception: continue
     return data
@@ -486,9 +493,21 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 horse_texts = []
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
+                    
+                    # 騎手情報構築 (乗り替わり判定)
                     p_jockey = h.get("prev_jockey_name", "")
                     p_info = f"(前:{p_jockey})" if p_jockey else ""
-                    power_line = f"【騎手】{h['power']}、{h['prev_power']} 相性:{h['compat']}"
+                    
+                    curr_p = h['power']
+                    prev_p_str = h['prev_power'] # "前P:5"
+                    
+                    # 今回騎手と1走前騎手が違い、かつ前Pがある場合のみ表示
+                    if h['jockey'] != h['first_prev_jockey'] and prev_p_str:
+                        # 例: P:5(前P:3)、 相性...
+                        power_line = f"【騎手】{curr_p}({prev_p_str})、 相性:{h['compat']}"
+                    else:
+                        power_line = f"【騎手】{curr_p}、 相性:{h['compat']}"
+
                     block = [
                         f"[{u}]{h['name']} 騎:{h['jockey']}{p_info} 師:{h['trainer']}",
                         f"話:{danwa.get(u,'なし')}", 
@@ -512,14 +531,16 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                     continue
 
                 # --- Dify モード ---
-                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中 (待機発生の可能性あり)..."}
                 ai_out = run_dify_prediction(full_prompt)
+                
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades)
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
                 final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
+                
                 yield {"type": "result", "race_num": r_num, "data": final_text}
                 time.sleep(15) 
 
