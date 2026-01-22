@@ -42,7 +42,7 @@ def get_http_session() -> requests.Session:
     sess.headers.update({
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
     })
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=(500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
@@ -76,6 +76,7 @@ def login_keibabook_robust(driver):
 # ==================================================
 def run_dify_prediction(full_text):
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
+    
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
     payload = {
         "inputs": {"text": full_text}, 
@@ -84,29 +85,44 @@ def run_dify_prediction(full_text):
     }
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
     sess = get_http_session()
-    full_response = ""
-    try:
-        with sess.post(url, headers=headers, json=payload, stream=True, timeout=120) as res:
-            if res.status_code != 200: return f"⚠️ Dify Error: {res.status_code}"
-            for line in res.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    if decoded_line.startswith('data:'):
-                        json_str = decoded_line[5:].strip()
-                        if not json_str: continue
-                        try:
-                            data = json.loads(json_str)
-                            event = data.get('event')
-                            if event == 'workflow_finished':
-                                outputs = data.get('data', {}).get('outputs', {})
-                                if 'text' in outputs: return outputs['text']
-                            elif event == 'text_chunk' or event == 'message':
-                                chunk = data.get('data', {}).get('text', '')
-                                full_response += chunk
-                        except: pass
-        return full_response if full_response else "（回答生成エラー）"
-    except Exception as e:
-        return f"⚠️ API Error: {e}"
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        full_response = ""
+        error_msg = ""
+        try:
+            with sess.post(url, headers=headers, json=payload, stream=True, timeout=120) as res:
+                if res.status_code == 429:
+                    wait_time = 65 
+                    time.sleep(wait_time)
+                    continue 
+
+                if res.status_code != 200:
+                    return f"⚠️ Dify Error: {res.status_code} {res.text[:100]}"
+                
+                for line in res.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith('data:'):
+                            json_str = decoded_line[5:].strip()
+                            if not json_str: continue
+                            try:
+                                data = json.loads(json_str)
+                                event = data.get('event')
+                                if event == 'workflow_finished':
+                                    outputs = data.get('data', {}).get('outputs', {})
+                                    if 'text' in outputs: return outputs['text']
+                                elif event == 'text_chunk' or event == 'message':
+                                    chunk = data.get('data', {}).get('text', '')
+                                    full_response += chunk
+                            except: pass
+                return full_response if full_response else "（回答生成エラー）"
+
+        except Exception as e:
+            error_msg = str(e)
+            time.sleep(5)
+    
+    return f"⚠️ エラー: リトライ上限を超えました ({error_msg})"
 
 # ==================================================
 # 4. データロード & 解析
@@ -224,6 +240,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
     data["meta"]["course"] = f"{place_name} {cond.get_text(strip=True)}" if cond else ""
     table = soup.select_one("#shosai_aria table.nk23_c-table22__table")
     if not table: return data
+    
     for row in table.select("tbody tr"):
         try:
             u_tag = row.select_one("td.umaban") or row.select_one("td.is-col02")
@@ -232,6 +249,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             if not umaban.isdigit(): continue
             h_link = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
             horse_name = h_link.get_text(strip=True) if h_link else "不明"
+            
             jg_td = row.select_one("td.cs-g1")
             j_raw, t_raw = "", ""
             if jg_td:
@@ -241,6 +259,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
             power_info = resources["power"].get((place_name, j_full), "P:不明")
+            
             ai2 = row.select_one("td.cs-ai2 .graph_text_div")
             pair_stats = "-"
             if ai2 and "データ" not in ai2.get_text():
@@ -248,34 +267,61 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 w = ai2.select_one(".is-number").get_text(strip=True)
                 t = ai2.select_one(".is-total").get_text(strip=True)
                 pair_stats = f"勝{r}({w}/{t})"
+            
             history = []
             prev_power_info = ""
+            
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
-                if not z or not z.get_text(strip=True): continue
-                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
+                if not z: continue
+                z_full_text = z.get_text(" ", strip=True)
+                if not z_full_text: continue
+
                 d_txt = ""
+                d_spans = z.select("p.nk23_u-d-flex span.nk23_u-text10")
                 if d_spans:
                     for s in d_spans:
-                        if re.search(r"\d+\.\d+\.\d+", s.get_text()): d_txt = s.get_text(strip=True); break
+                        if re.search(r"\d+\.\d+\.\d+", s.get_text()): 
+                            d_txt = s.get_text(strip=True); break
+                if not d_txt:
+                    m_dt = re.search(r"\d+\.\d+\.\d+", z_full_text)
+                    if m_dt: d_txt = m_dt.group(0)
+
                 ymd, place_short = "", ""
-                m = re.match(r"([^\d]+)(\d+)\.(\d+)\.(\d+)", d_txt)
+                m = re.match(r"([^\d]*?)(\d+)\.(\d+)\.(\d+)", d_txt)
                 if m:
-                    place_short = m.group(1)
+                    place_short = m.group(1) or place_name[0]
                     ymd = f"{m.group(2)}/{int(m.group(3))}/{int(m.group(4))}"
+
                 cond_txt = d_spans[-1].get_text(strip=True) if len(d_spans)>=2 else ""
+                if not cond_txt:
+                    m_dist = re.search(r"(ダ|芝)?\d{4}m?", z_full_text)
+                    if m_dist: cond_txt = m_dist.group(0)
+                
                 dist_m = re.search(r"\d{4}", cond_txt)
                 dist = dist_m.group(0) if dist_m else ""
-                course_s = f"{place_short}{dist}" if m else cond_txt
+                course_s = f"{place_short}{dist}"
+
                 r_a = z.select_one("a.is-link")
                 r_ti = r_a.get("title", "") if r_a else ""
                 rp = re.split(r'[ 　]+', r_ti)
                 r_cl = rp[1] if len(rp)>1 else ""
-                p_lines = z.select("p.nk23_u-text10")
-                j_prev, pop, agari = "", "", ""
-                rank = z.select_one(".nk23_u-text19").get_text(strip=True).replace("着","") if z.select_one(".nk23_u-text19") else ""
+                
+                rank = ""
+                r_tag = z.select_one(".nk23_u-text19")
+                if r_tag: rank = r_tag.get_text(strip=True).replace("着","")
+                if not rank:
+                    m_rnk = re.search(r'(\d{1,2})着', z_full_text)
+                    if m_rnk: rank = m_rnk.group(1)
+
                 pos_p = z.select_one("p.position")
                 pas = "-".join([s.get_text(strip=True) for s in pos_p.find_all("span")]) if pos_p else ""
+                if not pas:
+                    m_pas = re.search(r'(\d{1,2}-\d{1,2}(?:-\d{1,2})*)', z_full_text)
+                    if m_pas: pas = m_pas.group(1)
+
+                j_prev, pop, agari = "", "", ""
+                p_lines = z.select("p.nk23_u-text10")
                 for p in p_lines:
                     pt = p.get_text(strip=True)
                     if "人気" in pt:
@@ -286,12 +332,25 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if "3F" in pt:
                         am = re.search(r"\(([\d]+)\)", pt)
                         if am: agari = f"3F{am.group(1)}位"
+
+                if not pop:
+                    m_pop = re.search(r'(\d+)人', z_full_text)
+                    if m_pop: pop = f"{m_pop.group(1)}人"
+                if not agari:
+                    m_ag = re.search(r'3F(\d+)位?', z_full_text)
+                    if m_ag: agari = f"3F{m_ag.group(1)}位"
+                if not j_prev:
+                    m_j = re.search(r'([^\s\d]+?)\s*\d{2}\.\d', z_full_text)
+                    if m_j: j_prev = m_j.group(1)
+
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 if i == 1:
                     p_data = resources["power_data"].get((place_short, j_prev_full))
                     if p_data: prev_power_info = f"前P:{p_data['power']}"
+
                 h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
+                
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
                 "power": power_info, "prev_power": prev_power_info,
@@ -311,6 +370,7 @@ def _parse_grades_from_ai(text):
     return grades
 
 def _fetch_matchup_table(nankan_id, grades):
+    # 対戦表の取得元は /taisen/ だが、表示用リンクは /result/ を使うためここは解析用
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
     sess = get_http_session()
     try:
@@ -325,6 +385,7 @@ def _fetch_matchup_table(nankan_id, grades):
                     link = col.find('a')
                     races.append({
                         "title": det.get_text(" ", strip=True),
+                        # 内部解析用URL
                         "url": "https://www.nankankeiba.com" + link.get('href','') if link else "",
                         "results": []
                     })
@@ -360,24 +421,21 @@ def _fetch_matchup_table(nankan_id, grades):
             for x in r["results"]:
                 g = f"[{x['grade']}]" if x['grade'] else ""
                 line_parts.append(f"{x['rank']}着 {x['name']}{g}")
-            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts) + f"\n詳細: {r['url']}\n")
+            # ここではURLを表示せず、テーブル情報のみを返す
+            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts))
         return "\n".join(out)
     except: return "(対戦表エラー)"
 
 # ==================================================
-# 5. ジェネレータ (main.pyとの通信用)
+# 5. ジェネレータ (モード分岐対応)
 # ==================================================
-def run_races_iter(year, month, day, place_code, target_races, **kwargs):
-    """
-    yield {"type": "status"|"error"|"result", "data": ...}
-    """
+def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
     resources = load_resources()
     kb_input_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
     nk_code_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
     
     place_name = kb_input_map.get(place_code, "地方")
     nk_place_code = nk_code_map.get(place_code)
-
     driver = get_driver()
     
     try:
@@ -410,6 +468,9 @@ def run_races_iter(year, month, day, place_code, target_races, **kwargs):
                 nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
                 kb_id = get_kb_url_id(year, month, day, place_code, nichi, r_num)
                 
+                # 詳細リンク（resultページ形式）
+                result_url = f"https://www.nankankeiba.com/result/{nk_id}.do"
+                
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
@@ -440,7 +501,16 @@ def run_races_iter(year, month, day, place_code, target_races, **kwargs):
                 
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
                 
-                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
+                # --- 分岐ロジック ---
+                if mode == "raw":
+                    # 生データのみを返して次のレースへ
+                    final_text = f"{full_prompt}\n\n詳細リンク: {result_url}"
+                    yield {"type": "result", "race_num": r_num, "data": final_text}
+                    time.sleep(1)
+                    continue
+
+                # --- Dify モード ---
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中 (待機発生の可能性あり)..."}
                 ai_out = run_dify_prediction(full_prompt)
                 
                 grades = _parse_grades_from_ai(ai_out)
@@ -448,10 +518,11 @@ def run_races_iter(year, month, day, place_code, target_races, **kwargs):
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
-                final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
+                # 結果にResultページへのリンクを付与
+                final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
                 
                 yield {"type": "result", "race_num": r_num, "data": final_text}
-                time.sleep(2) 
+                time.sleep(15) 
 
             except Exception as e:
                 yield {"type": "error", "data": f"{r_num}R Error: {e}"}
