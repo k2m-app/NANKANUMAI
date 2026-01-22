@@ -119,40 +119,58 @@ def run_dify_prediction(full_text):
 # ==================================================
 @st.cache_resource
 def load_resources():
-    res = {"jockeys": [], "trainers": [], "power_data": {}}
+    res = {
+        "jockeys": [],     # マスタファイル由来のリスト
+        "trainers": [], 
+        "power_data": {},  # (場所, 騎手名) -> {power, win, fuku}
+        "power_jockeys": set() # パワーCSVに含まれる騎手名（優先正規化用）
+    }
     
-    # 1. マスタファイルから騎手・調教師リスト読み込み
-    # UTF-8でだめならShift-JISでトライ
-    for fpath, key in [(JOCKEY_FILE, "jockeys"), (TRAINER_FILE, "trainers")]:
-        if os.path.exists(fpath):
-            loaded = False
-            for enc in ["utf-8-sig", "cp932"]:
-                try:
-                    with open(fpath, "r", encoding=enc) as f:
-                        res[key] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
-                    loaded = True
-                    break
-                except: continue
+    # パス解決ヘルパー
+    def get_valid_path(target_path):
+        if os.path.exists(target_path): return target_path
+        basename = os.path.basename(target_path)
+        p2 = os.path.join(DATA_DIR, basename)
+        if os.path.exists(p2): return p2
+        if os.path.exists(basename): return basename
+        return None
+
+    # 1. 騎手・調教師リスト読み込み
+    j_path = get_valid_path(JOCKEY_FILE)
+    if j_path:
+        for enc in ["utf-8-sig", "cp932"]:
+            try:
+                with open(j_path, "r", encoding=enc) as f:
+                    res["jockeys"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
+                break
+            except: continue
+            
+    t_path = get_valid_path(TRAINER_FILE)
+    if t_path:
+        for enc in ["utf-8-sig", "cp932"]:
+            try:
+                with open(t_path, "r", encoding=enc) as f:
+                    res["trainers"] = [l.strip().replace(",","").replace(" ","").replace("　","") for l in f if l.strip()]
+                break
+            except: continue
 
     # 2. 騎手パワーCSV読み込み
-    if os.path.exists(POWER_FILE):
+    p_path = get_valid_path(POWER_FILE)
+    if p_path:
         df = None
         for enc in ["utf-8-sig", "cp932"]:
             try:
-                df = pd.read_csv(POWER_FILE, encoding=enc)
+                df = pd.read_csv(p_path, encoding=enc)
                 break
             except: continue
         
         if df is not None:
             try:
-                # カラム特定
                 place_col = df.columns[0]
                 has_win = '勝率' in df.columns
                 has_fuku = '複勝率' in df.columns
                 has_power = '騎手パワー' in df.columns
                 has_name = '騎手名' in df.columns
-
-                csv_jockeys = set()
 
                 for _, row in df.iterrows():
                     p = str(row[place_col]).strip()
@@ -161,12 +179,14 @@ def load_resources():
                     
                     if not j or not p: continue
 
-                    csv_jockeys.add(j)
+                    # パワーCSVにある名前を記録（正規化で優先するため）
+                    res["power_jockeys"].add(j)
 
                     val_power = str(row['騎手パワー']) if has_power else '-'
                     val_win = str(row['勝率']) if has_win else '-'
                     val_fuku = str(row['複勝率']) if has_fuku else '-'
 
+                    # キー: (場所, 騎手名)
                     key_t = (p, j)
                     res["power_data"][key_t] = {
                         "power": val_power,
@@ -174,9 +194,9 @@ def load_resources():
                         "fuku": val_fuku
                     }
                 
-                # マスタ補完
+                # JOCKEY_FILEにないがPOWER_FILEにある名前を統合リストにも追加
                 current_jockeys = set(res["jockeys"])
-                for j in csv_jockeys:
+                for j in res["power_jockeys"]:
                     if j not in current_jockeys:
                         res["jockeys"].append(j)
                         
@@ -185,9 +205,10 @@ def load_resources():
             
     return res
 
-def normalize_name(abbrev, full_list):
+def normalize_name(abbrev, full_list, priority_set=None):
     """
-    略称(abbrev)をフルネームリスト(full_list)から探して正規化する。
+    略称をフルネームに正規化する。
+    priority_setが指定されている場合、そこに含まれる名前を優先する。
     """
     if not abbrev: return ""
     clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
@@ -198,38 +219,21 @@ def normalize_name(abbrev, full_list):
     candidates = []
     for full in full_list:
         if all(c in full for c in clean):
-            candidates.append((len(full) - len(clean), full))
+            # 文字数差を計算
+            diff = len(full) - len(clean)
+            # 優先セットにある場合はボーナスを与える（diffをマイナス評価にするなど）
+            is_priority = 1 if (priority_set and full in priority_set) else 0
+            
+            # ソートキー: (優先度が高いほど先頭へ, 文字数差が小さいほど先頭へ)
+            # Pythonのsortは昇順なので、優先度を負の値にする
+            candidates.append((-is_priority, diff, full))
     
     if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
+        # (-優先有無, 文字数差) でソート
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2]
+    
     return clean
-
-def resolve_jockey_name_context_aware(abbrev, place, resources):
-    """
-    通常の正規化に加え、該当競馬場のパワーデータに存在する騎手名から
-    文脈を考慮してフルネームを特定する。
-    例: 船橋で「川島正」-> パワーデータ('船橋','川島正太郎')があればそちらを優先
-    """
-    clean = re.sub(r"[ 　▲△☆◇★\d\.]+", "", abbrev)
-    if not clean: return ""
-
-    # 1. 該当競馬場のパワーデータキーから候補を探す (文脈優先)
-    candidates = []
-    for (p, j_full) in resources["power_data"].keys():
-        if p == place:
-            # 略称の全文字が含まれているか
-            if all(c in j_full for c in clean):
-                candidates.append(j_full)
-    
-    if candidates:
-        # 文字数差が小さい順
-        candidates.sort(key=lambda x: len(x) - len(clean))
-        return candidates[0]
-
-    # 2. 見つからなければ通常の全体リストからの正規化
-    return normalize_name(abbrev, resources["jockeys"])
-
 
 def parse_nankankeiba_detail(html, place_name, resources):
     soup = BeautifulSoup(html, "html.parser")
@@ -261,7 +265,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             h_link = row.select_one("td.is-col03 a.is-link") or row.select_one("td.pr-umaName-textRound a.is-link")
             horse_name = h_link.get_text(strip=True) if h_link else "不明"
             
-            # --- 騎手・調教師 ---
+            # --- 今回の騎手・調教師 ---
             jg_td = row.select_one("td.cs-g1")
             j_raw, t_raw = "", ""
             if jg_td:
@@ -269,9 +273,9 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if len(links) >= 1: j_raw = links[0].get_text(strip=True)
                 if len(links) >= 2: t_raw = links[1].get_text(strip=True)
             
-            # 今回の騎手は全体リストから正規化
-            j_full = normalize_name(j_raw, resources["jockeys"])
-            t_full = normalize_name(t_raw, resources["trainers"])
+            # 正規化: パワーCSVにある名前を優先
+            j_full = normalize_name(j_raw, resources["jockeys"], resources["power_jockeys"])
+            t_full = normalize_name(t_raw, resources["trainers"], None)
             
             # --- 今回の騎手データ ---
             p_data_curr = resources["power_data"].get((place_name, j_full))
@@ -362,9 +366,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     pas_spans = [s.get_text(strip=True) for s in pos_p.find_all("span")]
                     pas = "-".join(pas_spans)
                 
-                # 7. 騎手名の解決 (文脈考慮: その開催場のパワーデータにある名前を優先)
-                # これにより「船橋」の「川島正」が「川島正太郎」に解決される
-                j_prev_full = resolve_jockey_name_context_aware(j_prev, place_short, resources)
+                # 7. 騎手名の正規化 (ここが重要)
+                # 略称 j_prev を、resources["jockeys"] から探し、
+                # resources["power_jockeys"] にある名前を優先して採用する
+                j_prev_full = normalize_name(j_prev, resources["jockeys"], resources["power_jockeys"])
                 if not j_prev_full and j_prev: j_prev_full = j_prev
 
                 # ★ 前走(i=1)のP取得 ★
@@ -374,7 +379,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     if p_data_prev:
                         prev_power_val = p_data_prev['power']
 
-                # --- 文字列生成 (解決済みフルネームを使用) ---
+                # --- 文字列生成 (正規化済み名前を使用) ---
                 agari_part = f"({agari})" if agari else "()"
                 pop_part = f"({pop})" if pop else ""
                 rank_part = f"{rank}着" if rank else "着不明"
