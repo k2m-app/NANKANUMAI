@@ -813,7 +813,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 ai_out_clean = re.sub(r"^\s*-{3,}\s*$", "", ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r"\n{3,}", "\n\n", ai_out_clean).strip()
 
-                final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
+                final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
                 yield {"type": "result", "race_num": r_num, "data": final_text}
                 time.sleep(15)
 
