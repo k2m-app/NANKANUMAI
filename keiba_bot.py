@@ -40,7 +40,7 @@ DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 def get_http_session() -> requests.Session:
     sess = requests.Session()
     sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
     })
     retry = Retry(total=3, backoff_factor=1, status_forcelist=(500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retry)
@@ -89,14 +89,11 @@ def run_dify_prediction(full_text):
     max_retries = 3
     for attempt in range(max_retries):
         full_response = ""
-        error_msg = ""
         try:
             with sess.post(url, headers=headers, json=payload, stream=True, timeout=120) as res:
                 if res.status_code == 429:
-                    wait_time = 65 
-                    time.sleep(wait_time)
-                    continue 
-
+                    time.sleep(60)
+                    continue
                 if res.status_code != 200:
                     return f"⚠️ Dify Error: {res.status_code} {res.text[:100]}"
                 
@@ -117,12 +114,9 @@ def run_dify_prediction(full_text):
                                     full_response += chunk
                             except: pass
                 return full_response if full_response else "（回答生成エラー）"
-
         except Exception as e:
-            error_msg = str(e)
             time.sleep(5)
-    
-    return f"⚠️ エラー: リトライ上限を超えました ({error_msg})"
+    return "⚠️ エラー: リトライ上限を超えました"
 
 # ==================================================
 # 4. データロード & 解析
@@ -369,27 +363,43 @@ def _parse_grades_from_ai(text):
             if n: grades[n] = g
     return grades
 
-def _fetch_matchup_table(nankan_id, grades):
-    # 対戦表の取得元は /taisen/ だが、表示用リンクは /result/ を使うためここは解析用
+def _fetch_matchup_table_selenium(driver, nankan_id, grades):
+    """
+    Seleniumを使って対戦表を確実に取得する。
+    URL: https://www.nankankeiba.com/taisen/{nankan_id}.do
+    """
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
-    sess = get_http_session()
     try:
-        soup = BeautifulSoup(sess.get(url, timeout=10).content, 'html.parser', from_encoding='cp932')
+        driver.get(url)
+        time.sleep(0.5) 
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
         tbl = soup.find('table', class_='nk23_c-table08__table')
         if not tbl: return "\n(対戦データなし)"
+
         races = []
         if tbl.find('thead'):
             for col in tbl.find('thead').find_all(['th','td'])[2:]:
                 det = col.find(class_='nk23_c-table08__detail')
                 if det:
                     link = col.find('a')
+                    href = link.get('href','')
+                    full_url = ""
+                    if href:
+                        if href.startswith('..'):
+                            full_url = "https://www.nankankeiba.com" + href[2:]
+                        elif href.startswith('/'):
+                            full_url = "https://www.nankankeiba.com" + href
+                        else:
+                            full_url = "https://www.nankankeiba.com/result/" + href
+
                     races.append({
                         "title": det.get_text(" ", strip=True),
-                        # 内部解析用URL
-                        "url": "https://www.nankankeiba.com" + link.get('href','') if link else "",
+                        "url": full_url,
                         "results": []
                     })
+        
         if not races: return "\n(初対戦)"
+
         if tbl.find('tbody'):
             for tr in tbl.find('tbody').find_all('tr'):
                 u = tr.find('a', class_='nk23_c-table08__text')
@@ -399,11 +409,13 @@ def _fetch_matchup_table(nankan_id, grades):
                 if not grade:
                     for k,v in grades.items():
                         if k in name or name in k: grade = v; break
+                
                 cells = tr.find_all(['td','th'])
                 idx_st = -1
                 for i, c in enumerate(cells):
                     if c.find('a', class_='nk23_c-table08__text'): idx_st=i; break
                 if idx_st == -1: continue
+
                 for i, c in enumerate(cells[idx_st+1:]):
                     if i >= len(races): break
                     rp = c.find('p', class_='nk23_c-table08__number')
@@ -413,6 +425,7 @@ def _fetch_matchup_table(nankan_id, grades):
                         rnk = sp.get_text(strip=True) if sp else rp.get_text(strip=True).split('｜')[0].strip()
                     if rnk and (rnk.isdigit() or rnk in ['除外','中止']):
                         races[i]["results"].append({"rank":rnk, "name":name, "grade":grade, "sort":int(rnk) if rnk.isdigit() else 999})
+
         out = ["\n【対戦表（AI評価付き）】"]
         for r in races:
             if not r["results"]: continue
@@ -421,10 +434,11 @@ def _fetch_matchup_table(nankan_id, grades):
             for x in r["results"]:
                 g = f"[{x['grade']}]" if x['grade'] else ""
                 line_parts.append(f"{x['rank']}着 {x['name']}{g}")
-            # ここではURLを表示せず、テーブル情報のみを返す
-            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts))
+            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts) + (f"\nLink: {r['url']}" if r['url'] else ""))
+            
         return "\n".join(out)
-    except: return "(対戦表エラー)"
+    except Exception as e:
+        return f"(対戦表取得エラー: {e})"
 
 # ==================================================
 # 5. ジェネレータ (モード分岐対応)
@@ -433,7 +447,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
     resources = load_resources()
     kb_input_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
     nk_code_map = {"10":"20", "11":"21", "12":"19", "13":"18"}
-    
     place_name = kb_input_map.get(place_code, "地方")
     nk_place_code = nk_code_map.get(place_code)
     driver = get_driver()
@@ -468,7 +481,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
                 kb_id = get_kb_url_id(year, month, day, place_code, nichi, r_num)
                 
-                # 詳細リンク（resultページ形式）
                 result_url = f"https://www.nankankeiba.com/result/{nk_id}.do"
                 
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
@@ -493,18 +505,18 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                         power_line,
                         "【近走】"
                     ]
-                    cn_map = {0:"[前走]", 1:"[2走前]", 2:"[3走前]"}
                     for idx, hs in enumerate(h["hist"]):
-                        prefix = cn_map.get(idx, f"[{idx+1}走]")
-                        block.append(f"{prefix} {hs}")
+                        block.append(f"{hs}")
                     horse_texts.append("\n".join(block))
                 
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
                 
-                # --- 分岐ロジック ---
+                # --- Raw モード ---
                 if mode == "raw":
-                    # 生データのみを返して次のレースへ
-                    final_text = f"{full_prompt}\n\n詳細リンク: {result_url}"
+                    yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
+                    # 評価なしで対戦表を取得 (空のgradesを渡す)
+                    match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
+                    final_text = f"{full_prompt}\n\n{match_txt}\n\n詳細リンク: {result_url}"
                     yield {"type": "result", "race_num": r_num, "data": final_text}
                     time.sleep(1)
                     continue
@@ -514,11 +526,10 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 ai_out = run_dify_prediction(full_prompt)
                 
                 grades = _parse_grades_from_ai(ai_out)
-                match_txt = _fetch_matchup_table(nk_id, grades)
+                match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades)
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
-                # 結果にResultページへのリンクを付与
                 final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
                 
                 yield {"type": "result", "race_num": r_num, "data": final_text}
