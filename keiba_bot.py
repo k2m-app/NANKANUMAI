@@ -318,7 +318,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if len(links) >= 2:
                     t_raw = links[1].get_text(strip=True)
 
-            # 正規化: ★power_jockeys は「フルネーム集合」になったので、priorityが確実に効く
+            # 正規化
             j_full = normalize_name(j_raw, resources["jockeys"], resources["power_jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"], None)
 
@@ -403,14 +403,18 @@ def parse_nankankeiba_detail(html, place_name, resources):
                             j_prev = re.sub(r"[\d\.]+", "", j_cand)
                         break
 
-                # 5. 上がり3F
+                # ==================================================
+                # ★ 5. 上がり3F (修正箇所)
+                # ==================================================
+                # HTML構造: <span class="furlongtime">3F 39.4(8)</span>
+                # 直接クラス指定で取得します
                 agari = ""
-                for p in p_lines:
-                    ptxt = p.get_text(" ", strip=True)
-                    if "3F" in ptxt:
-                        am = re.search(r"3F.*?\((\d+)\)", ptxt)
-                        if am:
-                            agari = f"3F:{am.group(1)}位"
+                ft_elem = z.select_one(".furlongtime")
+                if ft_elem:
+                    # 例: "3F 39.4(8)" そのまま取得
+                    agari = ft_elem.get_text(strip=True)
+                
+                # ==================================================
 
                 # 6. 通過順
                 pos_p = z.select_one("p.position")
@@ -419,7 +423,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     pas_spans = [s.get_text(strip=True) for s in pos_p.find_all("span")]
                     pas = "-".join(pas_spans)
 
-                # 7. 騎手名の正規化（★最大3文字でもフルネームへ）
+                # 7. 騎手名の正規化
                 j_prev_full = normalize_name(j_prev, resources["jockeys"], resources["power_jockeys"])
                 if not j_prev_full and j_prev:
                     j_prev_full = j_prev
@@ -455,7 +459,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
         except Exception:
             continue
     return data
-
 # ==================================================
 # 5. ヘルパー関数 (URL, カレンダー等)
 # ==================================================
