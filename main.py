@@ -17,12 +17,20 @@ with st.sidebar:
     place_code = place_options[selected_place]
     
     st.divider()
+    st.subheader("モード選択")
+    # ここでモード分岐を作成
+    exec_mode = st.radio(
+        "実行モード",
+        ("dify", "raw"),
+        format_func=lambda x: "🤖 AIで予想する(Dify)" if x == "dify" else "📋 データのみ取得(コピペ用)"
+    )
+    
+    st.divider()
     st.subheader("対象レース選択")
     
     if "selected_races" not in st.session_state:
         st.session_state.selected_races = [10, 11, 12]
 
-    # チェックボックス同期
     for r in range(1, 13):
         key_name = f"chk_{r}"
         if key_name not in st.session_state:
@@ -51,8 +59,8 @@ with st.sidebar:
     if "results_cache" not in st.session_state:
         st.session_state.results_cache = {}
 
-    st.caption("※Dify生成待機: 最大10分/レース")
-    start_btn = st.button("予想開始", type="primary", key="btn_start")
+    st.caption("※AI予想は最大10分/レース程度かかる場合があります")
+    start_btn = st.button("実行開始", type="primary", key="btn_start")
     
     if st.button("結果クリア"):
         st.session_state.results_cache = {}
@@ -62,7 +70,7 @@ with st.sidebar:
 def get_combined_results(cache, place_name, date_obj):
     if not cache: return ""
     text_list = []
-    text_list.append(f"【{date_obj.strftime('%Y/%m/%d')} {place_name} AI予想 & 対戦表まとめ】\n")
+    text_list.append(f"【{date_obj.strftime('%Y/%m/%d')} {place_name} データまとめ】\n")
     for r_num, content in sorted(cache.items()):
         text_list.append(f"\n{'='*35}\n {place_name} {r_num}R\n{'='*35}\n")
         text_list.append(content)
@@ -72,30 +80,28 @@ def get_combined_results(cache, place_name, date_obj):
 # --- メイン処理エリア ---
 result_container = st.container()
 
-# 1. 既存の結果表示（キャッシュがある場合）
+# 1. 既存の結果表示
 if st.session_state.results_cache and not start_btn:
     with result_container:
         st.success("📝 生成結果を表示しています")
         
-        # まとめ表示
         full_text = get_combined_results(st.session_state.results_cache, selected_place, target_date)
         with st.expander("📚 全レース結果をまとめてコピーする", expanded=True):
             st.text_area("全レース結果", value=full_text, height=300, key="res_all_summary")
         
         st.divider()
 
-        # 個別表示
         for r_num, text in sorted(st.session_state.results_cache.items()):
             st.subheader(f"{selected_place} {r_num}R")
             st.text_area(
                 label=f"{r_num}R 結果",
                 value=text,
                 height=500,
-                key=f"res_cache_{r_num}" # ユニークなキー
+                key=f"res_cache_{r_num}"
             )
             st.divider()
 
-# 2. 新規実行ロジック
+# 2. 新規実行
 if start_btn:
     if not selected_races_final:
         st.warning("レースを選択してください。")
@@ -108,10 +114,11 @@ if start_btn:
     day = f"{target_date.day:02}"
     
     status_area = st.empty()
-    status_area.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 ({len(selected_races_final)}レース) の予想を開始します...")
+    mode_text = "AI予想" if exec_mode == "dify" else "データ取得"
+    status_area.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 ({len(selected_races_final)}レース) の【{mode_text}】を開始します...")
 
-    # ジェネレータ実行 (Dictを受け取る)
-    for event in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), ui=True):
+    # ジェネレータ実行 (モード引数を渡す)
+    for event in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), mode=exec_mode):
         
         e_type = event.get("type")
         e_data = event.get("data")
@@ -126,17 +133,15 @@ if start_btn:
             race_num = event.get("race_num")
             output_text = e_data
             
-            # キャッシュ保存
             st.session_state.results_cache[race_num] = output_text
             
-            # その場で表示（DuplicateKeyを防ぐため、キーにタイムスタンプ等を付与するか、単にキャッシュキーと区別する）
             with result_container:
                 st.subheader(f"{selected_place} {race_num}R")
                 st.text_area(
                     label=f"{race_num}R 結果 (速報)",
                     value=output_text,
                     height=500,
-                    key=f"res_live_{race_num}" # ライブ表示用のキー
+                    key=f"res_live_{race_num}"
                 )
                 st.divider()
             
