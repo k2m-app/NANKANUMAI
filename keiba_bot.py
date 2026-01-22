@@ -76,13 +76,8 @@ def login_keibabook_robust(driver):
 # ==================================================
 def run_dify_prediction(full_text):
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
-    
     url = f"{(DIFY_BASE_URL or '').strip().rstrip('/')}/v1/workflows/run"
-    payload = {
-        "inputs": {"text": full_text}, 
-        "response_mode": "streaming", 
-        "user": "keiba-bot"
-    }
+    payload = {"inputs": {"text": full_text}, "response_mode": "streaming", "user": "keiba-bot"}
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
     sess = get_http_session()
     
@@ -95,7 +90,7 @@ def run_dify_prediction(full_text):
                     time.sleep(60)
                     continue
                 if res.status_code != 200:
-                    return f"⚠️ Dify Error: {res.status_code} {res.text[:100]}"
+                    return f"⚠️ Dify Error: {res.status_code}"
                 
                 for line in res.iter_lines():
                     if line:
@@ -114,7 +109,7 @@ def run_dify_prediction(full_text):
                                     full_response += chunk
                             except: pass
                 return full_response if full_response else "（回答生成エラー）"
-        except Exception as e:
+        except Exception:
             time.sleep(5)
     return "⚠️ エラー: リトライ上限を超えました"
 
@@ -364,10 +359,6 @@ def _parse_grades_from_ai(text):
     return grades
 
 def _fetch_matchup_table_selenium(driver, nankan_id, grades):
-    """
-    Seleniumを使って対戦表を確実に取得する。
-    URL: https://www.nankankeiba.com/taisen/{nankan_id}.do
-    """
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
     try:
         driver.get(url)
@@ -441,7 +432,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
         return f"(対戦表取得エラー: {e})"
 
 # ==================================================
-# 5. ジェネレータ (モード分岐対応)
+# 5. ジェネレータ (モード分岐対応・修正版)
 # ==================================================
 def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
     resources = load_resources()
@@ -514,7 +505,6 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 # --- Raw モード ---
                 if mode == "raw":
                     yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
-                    # 評価なしで対戦表を取得 (空のgradesを渡す)
                     match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
                     final_text = f"{full_prompt}\n\n{match_txt}\n\n詳細リンク: {result_url}"
                     yield {"type": "result", "race_num": r_num, "data": final_text}
@@ -522,16 +512,14 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                     continue
 
                 # --- Dify モード ---
-                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中 (待機発生の可能性あり)..."}
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
                 ai_out = run_dify_prediction(full_prompt)
-                
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades)
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
                 final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}\n\n詳細リンク: {result_url}"
-                
                 yield {"type": "result", "race_num": r_num, "data": final_text}
                 time.sleep(15) 
 
