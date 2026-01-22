@@ -52,7 +52,7 @@ def get_driver():
     ops = Options()
     ops.add_argument("--headless=new")
     ops.add_argument("--no-sandbox")
-    ops.add_argument("--disable-dev-shm-usage")
+    ops.add_argument("--disable-dev-shm-usage") # Streamlit Cloudでのメモリ対策
     ops.add_argument("--disable-gpu")
     ops.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=ops)
@@ -75,7 +75,7 @@ def login_keibabook_robust(driver):
         return False
 
 # ==================================================
-# 3. Dify API (ストリーミング版・完全復活)
+# 3. Dify API (ストリーミング版)
 # ==================================================
 def run_dify_prediction(full_text):
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
@@ -174,7 +174,6 @@ def normalize_name(abbrev, full_list):
     return clean
 
 def get_nankan_kai_nichi(month, day, place_name):
-    """開催回の特定ロジック（オリジナル版）"""
     url = "https://www.nankankeiba.com/bangumi_menu/bangumi.do"
     sess = get_http_session()
     try:
@@ -208,13 +207,12 @@ def get_kb_url_id(year, month, day, place_code, nichi, race_num):
     return f"{year}{str(month).zfill(2)}{str(place_code).zfill(2)}{str(nichi).zfill(2)}{str(race_num).zfill(2)}{str(month).zfill(2)}{str(day).zfill(2)}"
 
 # ==================================================
-# 5. スクレイピングロジック（オリジナル版の完全復活）
+# 5. スクレイピングロジック
 # ==================================================
 def parse_kb_danwa_cyokyo(driver, kb_id):
-    """競馬ブックの談話と調教を詳細に取得"""
+    """競馬ブックの談話と調教"""
     d_danwa, d_cyokyo = {}, {}
     try:
-        # --- 談話 ---
         driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
         if "login" in driver.current_url:
             login_keibabook_robust(driver)
@@ -234,7 +232,6 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                     else: d_danwa[curr] = raw_text 
                     curr = None
 
-        # --- 調教 ---
         driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tbl in soup.select("table.cyokyo"):
@@ -245,18 +242,16 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
             if not u_td: continue
             uma = u_td.get_text(strip=True)
             tp_txt = r1.select_one("td.tanpyo").get_text(strip=True) if r1.select_one("td.tanpyo") else ""
-            
             dt_txt = ""
             if len(rows) > 1:
                 dt_raw = rows[1].get_text(" ", strip=True)
                 dt_txt = re.sub(r'\s+', ' ', dt_raw)
-            
             d_cyokyo[uma] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
     except: pass
     return d_danwa, d_cyokyo
 
 def parse_nankankeiba_detail(html, place_name, resources):
-    """南関競馬の詳細データを解析（履歴3走分含む）"""
+    """南関競馬の詳細データを解析"""
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
 
@@ -311,7 +306,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             history = []
             prev_power_info = ""
 
-            # 過去3走の解析 (cs-z1 ~ cs-z3)
+            # 過去3走
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z or not z.get_text(strip=True): continue
@@ -357,7 +352,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
                         if am: agari = f"3F{am.group(1)}位"
                 
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
-                
                 if i == 1:
                     p_data = resources["power_data"].get((place_short, j_prev_full))
                     if p_data: prev_power_info = f"前P:{p_data['power']}"
@@ -384,7 +378,6 @@ def _parse_grades_from_ai(text):
     return grades
 
 def _fetch_matchup_table(nankan_id, grades):
-    """対戦表の取得とAI評価のマージ（オリジナル版復活）"""
     url = f"https://www.nankankeiba.com/taisen/{nankan_id}.do"
     sess = get_http_session()
     try:
@@ -444,12 +437,11 @@ def _fetch_matchup_table(nankan_id, grades):
     except: return "(対戦表エラー)"
 
 # ==================================================
-# 6. ジェネレータ（データ受け渡しの中核）
+# 6. ジェネレータ (TypeError対策のため **kwargs 追加)
 # ==================================================
-def run_races_iter(year, month, day, place_code, target_races):
+def run_races_iter(year, month, day, place_code, target_races, **kwargs):
     """
-    辞書形式でステータスと結果をYieldする安全なジェネレータ
-    yield {"type": "status"|"error"|"result", "data": ...}
+    **kwargs を追加して、呼び出し元が ui=True 等を指定してもエラーにならないように修正。
     """
     resources = load_resources()
     kb_input_map = {"10":"大井", "11":"川崎", "12":"船橋", "13":"浦和"}
@@ -459,8 +451,7 @@ def run_races_iter(year, month, day, place_code, target_races):
     nk_place_code = nk_code_map.get(place_code)
 
     driver = get_driver()
-    wait = WebDriverWait(driver, 10)
-
+    
     try:
         yield {"type": "status", "data": f"📅 開催特定中 ({place_name})..."}
         kai, nichi = get_nankan_kai_nichi(month, day, place_name)
@@ -491,16 +482,14 @@ def run_races_iter(year, month, day, place_code, target_races):
                 nk_id = f"{year}{month}{day}{nk_place_code}{kai:02}{nichi:02}{r_num:02}"
                 kb_id = get_kb_url_id(year, month, day, place_code, nichi, r_num)
                 
-                # 詳細データの取得
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
                 
                 if not nk_data["horses"]:
-                    yield {"type": "result", "race_num": r_num, "data": "⚠️ データが見つかりませんでした"}
+                    yield {"type": "result", "race_num": r_num, "data": "⚠️ データなし"}
                     continue
 
-                # プロンプト作成
                 header = f"レース名:{r_num}R {nk_data['meta'].get('race_name','')} 格:{nk_data['meta'].get('grade','')} コース:{nk_data['meta'].get('course','')}"
                 horse_texts = []
                 
@@ -529,20 +518,16 @@ def run_races_iter(year, month, day, place_code, target_races):
                 yield {"type": "status", "data": f"🤖 {r_num}R AI予測生成中..."}
                 ai_out = run_dify_prediction(full_prompt)
                 
-                # グレード抽出 & 対戦表生成
                 grades = _parse_grades_from_ai(ai_out)
                 match_txt = _fetch_matchup_table(nk_id, grades)
                 
-                # クリーニング
                 ai_out_clean = re.sub(r'^\s*-{3,}\s*$', '', ai_out, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r'\n{3,}', '\n\n', ai_out_clean).strip()
 
                 final_text = f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n=== 🤖AI予想 ===\n{ai_out_clean}\n\n{match_txt}"
                 
-                # 結果送信
                 yield {"type": "result", "race_num": r_num, "data": final_text}
-                
-                time.sleep(2) # 負荷調整
+                time.sleep(2) 
 
             except Exception as e:
                 yield {"type": "result", "race_num": r_num, "data": f"Error: {e}"}
@@ -559,17 +544,15 @@ def main():
     st.set_page_config(page_title="NANKAN AI Master Pro", layout="wide")
     st.title("🏇 NANKAN AI Master Pro")
 
-    # --- Sidebar ---
+    # サイドバー
     st.sidebar.header("設定")
     today = datetime.now()
     col1, col2 = st.sidebar.columns(2)
     s_year = col1.number_input("年", value=today.year)
     s_month = col2.number_input("月", value=today.month)
     s_day = st.sidebar.number_input("日", value=today.day)
-    s_place = st.sidebar.selectbox("場所", 
-        options=["10","11","12","13"], 
-        format_func=lambda x: {"10":"大井","11":"川崎","12":"船橋","13":"浦和"}.get(x)
-    )
+    s_place = st.sidebar.selectbox("場所", options=["10","11","12","13"], 
+        format_func=lambda x: {"10":"大井","11":"川崎","12":"船橋","13":"浦和"}.get(x))
     
     target_race_input = st.sidebar.text_input("レース指定 (例: 1,2,11 / 空白で全R)", "")
     
@@ -577,25 +560,22 @@ def main():
     if "results" not in st.session_state:
         st.session_state.results = {}
 
-    # 実行ボタン
+    # 実行
     if st.sidebar.button("分析開始", type="primary"):
         target_races = [int(x.strip()) for x in target_race_input.split(",")] if target_race_input.strip() else []
         
-        st.session_state.logs = []
         status_container = st.status("🚀 システム起動中...", expanded=True)
         
-        # ジェネレータから辞書を受け取る（エラー回避の要）
-        for event in run_races_iter(s_year, s_month, s_day, s_place, target_races):
+        # Generator実行 (ui=Trueを指定しても **kwargs で受け流すのでエラーにならない)
+        for event in run_races_iter(s_year, s_month, s_day, s_place, target_races, ui=True):
             
             e_type = event.get("type")
             e_data = event.get("data")
             
             if e_type == "status":
                 status_container.write(e_data)
-                
             elif e_type == "error":
                 status_container.error(e_data)
-                
             elif e_type == "result":
                 r_num = event.get("race_num")
                 st.session_state.results[r_num] = e_data
@@ -603,15 +583,14 @@ def main():
         
         status_container.update(label="✨ 全処理完了", state="complete", expanded=False)
 
-    # 結果表示（Stateから読み出し）
+    # 結果表示
     st.divider()
     st.subheader(f"📊 分析結果一覧 ({len(st.session_state.results)}レース済)")
 
     if not st.session_state.results:
         st.info("👈 サイドバーから分析を開始してください")
     else:
-        sorted_keys = sorted(st.session_state.results.keys())
-        for r in sorted_keys:
+        for r in sorted(st.session_state.results.keys()):
             txt = st.session_state.results[r]
             with st.expander(f"🏁 {r}R の予想結果を見る", expanded=False):
                 st.code(txt, language="text")
