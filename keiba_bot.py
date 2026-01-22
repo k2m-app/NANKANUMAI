@@ -5,7 +5,6 @@ import json
 import requests
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 
 # Selenium
 from selenium import webdriver
@@ -26,6 +25,8 @@ from urllib3.util.retry import Retry
 DATA_DIR = "2025data"
 JOCKEY_FILE = os.path.join(DATA_DIR, "2025_NARJockey.csv")
 TRAINER_FILE = os.path.join(DATA_DIR, "2025_NankanTrainer.csv")
+
+# ★ここがあなたのPOWER_FILE（A列=競馬場名 / C列=騎手名）
 POWER_FILE = os.path.join(DATA_DIR, "2025_騎手パワー.csv")
 
 # Secrets
@@ -33,6 +34,7 @@ KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
+
 
 # ==================================================
 # 2. 共通関数
@@ -59,11 +61,14 @@ def get_driver():
     ops.add_argument("--window-size=1920,2200")
     ops.add_argument("--lang=ja-JP")
     ops.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    # 画像ロード抑制（体感安定すること多い）
+    # 画像ロード抑制（安定すること多い）
     ops.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
     return webdriver.Chrome(options=ops)
 
 def login_keibabook_robust(driver):
+    """
+    keibabook smart ログイン（失敗してもアプリは続行できる設計）
+    """
     try:
         driver.get("https://s.keibabook.co.jp/login/login")
         time.sleep(1)
@@ -78,6 +83,7 @@ def login_keibabook_robust(driver):
     except Exception:
         return False
 
+
 # ==================================================
 # 3. Dify API
 # ==================================================
@@ -91,7 +97,7 @@ def run_dify_prediction(full_text):
     sess = get_http_session()
 
     max_retries = 3
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         full_response = ""
         try:
             with sess.post(url, headers=headers, json=payload, stream=True, timeout=120) as res:
@@ -132,13 +138,19 @@ def run_dify_prediction(full_text):
 
     return "⚠️ エラー: リトライ上限を超えました"
 
+
 # ==================================================
 # 4. データロード & 解析
 # ==================================================
 @st.cache_resource
 def load_resources():
+    """
+    ★POWER_FILEは「A列=競馬場名」「C列=騎手名」で引ける前提の最適化版
+    - power_data[(place, jockey)] = {power, win_rate, fuku_rate}
+    """
     res = {"jockeys": [], "trainers": [], "power": {}, "power_data": {}}
 
+    # jockey / trainer list
     for fpath, key in [(JOCKEY_FILE, "jockeys"), (TRAINER_FILE, "trainers")]:
         if os.path.exists(fpath):
             try:
@@ -147,18 +159,37 @@ def load_resources():
             except Exception:
                 pass
 
+    # POWER_FILE: A列=競馬場名 / C列=騎手名
     if os.path.exists(POWER_FILE):
         try:
             df = pd.read_csv(POWER_FILE, encoding="utf-8-sig")
-            place_col = df.columns[0]
+
+            place_col = df.columns[0]  # A列（列名は Unnamed: 0 のことがある）
+            jockey_col = "騎手名"       # C列
+
+            # あなたのCSVにある列名前提
+            power_col = "騎手パワー"
+            win_col = "勝率"
+            fuku_col = "複勝率"
+
             for _, row in df.iterrows():
-                p = str(row[place_col]).strip()
-                j = str(row.get("騎手名", "")).replace(" ", "").replace("　", "")
-                if p and j:
-                    val = row.get("騎手パワー", "-")
-                    key_t = (p, j)
-                    res["power"][key_t] = f"P:{val}"
-                    res["power_data"][key_t] = {"power": val}
+                place = str(row.get(place_col, "")).strip()
+                jockey = str(row.get(jockey_col, "")).replace(" ", "").replace("　", "").strip()
+                if not place or not jockey:
+                    continue
+
+                power = str(row.get(power_col, "")).strip()
+                win = str(row.get(win_col, "")).strip()
+                fuku = str(row.get(fuku_col, "")).strip()
+
+                key_t = (place, jockey)
+                res["power"][key_t] = f"P:{power}" if power else "P:不明"
+                res["power_data"][key_t] = {
+                    "power": power,
+                    "win_rate": win,
+                    "fuku_rate": fuku
+                }
+
         except Exception:
             pass
 
@@ -190,8 +221,8 @@ def get_nankan_kai_nichi(month, day, place_name):
         res = sess.get(url, timeout=10)
         res.encoding = "cp932"
         soup = BeautifulSoup(res.text, "html.parser")
-        target_m, target_d = int(month), int(day)
 
+        target_m, target_d = int(month), int(day)
         for tr in soup.find_all("tr"):
             text = tr.get_text(" ", strip=True)
             if place_name not in text:
@@ -253,15 +284,15 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                 dt_raw = rows[1].get_text(" ", strip=True)
                 dt_txt = re.sub(r"\s+", " ", dt_raw)
             d_cyokyo[uma] = f"【短評】{tp_txt} 【詳細】{dt_txt}"
-
     except Exception:
         pass
 
     return d_danwa, d_cyokyo
 
-# ----------------------------
-# ★ここが核心：過去走の頑丈パーサ
-# ----------------------------
+
+# ==================================================
+# 5. nankankeiba パース（★要望①②対応の核心）
+# ==================================================
 PLACE_MAP = {
     "船": "船橋", "船橋": "船橋",
     "大": "大井", "大井": "大井",
@@ -270,14 +301,58 @@ PLACE_MAP = {
     "門": "門別", "門別": "門別",
 }
 
+def _normalize_place_token(raw_p: str, fallback_place: str) -> str:
+    if not raw_p:
+        return fallback_place
+    s = re.sub(r"\s+", " ", str(raw_p)).strip()
+    # ★「着」混入を除去
+    s = s.replace("着", "").strip()
+
+    for k, v in PLACE_MAP.items():
+        if k and k in s:
+            return v
+
+    s1 = s[:1]
+    if s1 in PLACE_MAP:
+        return PLACE_MAP[s1]
+
+    return fallback_place
+
+def _format_rate(val) -> str:
+    """
+    "10.0%" → "10%" / "0.1" → "10%" / "10" → "10%"
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s or s in ("-", "nan", "NaN", "None"):
+        return ""
+
+    if "%" in s:
+        m = re.search(r"([\d\.]+)", s)
+        if not m:
+            return s
+        try:
+            return f"{round(float(m.group(1)))}%"
+        except Exception:
+            return s
+
+    try:
+        x = float(s)
+        if x <= 1.0:
+            x *= 100.0
+        return f"{round(x)}%"
+    except Exception:
+        return ""
+
 def _parse_date_place(text, fallback_place):
     """
-    text から「場所 + 日付」を複数パターンで拾う
+    cs-zセルのテキストから「場所 + 日付」を拾う
     """
     s = re.sub(r"\s+", " ", (text or "")).strip()
 
-    # 例: 大 26.1.22 / 大井 26.1.22 / 船橋 2026.1.22
-    m = re.search(r"([^\d]{0,6})\s*(\d{2,4})\.(\d{1,2})\.(\d{1,2})", s)
+    # 例: 大 26.1.22 / 着 船橋 25.12.9
+    m = re.search(r"([^\d]{0,12})\s*(\d{2,4})\.(\d{1,2})\.(\d{1,2})", s)
     if m:
         raw_p = (m.group(1) or "").strip()
         y = int(m.group(2))
@@ -285,31 +360,27 @@ def _parse_date_place(text, fallback_place):
             y = 2000 + y
         mm = int(m.group(3))
         dd = int(m.group(4))
-        place = PLACE_MAP.get(raw_p, raw_p) if raw_p else fallback_place
-        ymd = f"{y}/{mm}/{dd}"
-        return place or fallback_place, ymd
+        place = _normalize_place_token(raw_p, fallback_place)
+        return place, f"{y}/{mm}/{dd}"
 
-    # 例: 2026/1/22
-    m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", s)
+    # 例: 2026/1/22（もしスラッシュ表記が出る場合）
+    m = re.search(r"([^\d]{0,12})\s*(\d{4})/(\d{1,2})/(\d{1,2})", s)
     if m:
-        y = int(m.group(1)); mm = int(m.group(2)); dd = int(m.group(3))
-        return fallback_place, f"{y}/{mm}/{dd}"
+        raw_p = (m.group(1) or "").strip()
+        place = _normalize_place_token(raw_p, fallback_place)
+        y = int(m.group(2)); mm = int(m.group(3)); dd = int(m.group(4))
+        return place, f"{y}/{mm}/{dd}"
 
     return fallback_place, "不明"
 
 def _parse_dist(text):
     s = re.sub(r"\s+", " ", (text or "")).strip()
-
-    # 「ダ 1600」や「ダート1600」優先（数字が日付に引っ張られない）
     m = re.search(r"(?:ダート|ダ|芝)\s*([0-9]{3,4})", s)
     if m:
         return m.group(1)
-
-    # 「1600m」型（最後の m 付き距離を採用）
     ms = re.findall(r"([0-9]{3,4})\s*m", s)
     if ms:
         return ms[-1]
-
     return ""
 
 def _parse_rank(text):
@@ -323,15 +394,10 @@ def _parse_popularity(text):
     return f"{m.group(1)}人" if m else ""
 
 def _parse_jockey_from_pop_line(text):
-    """
-    「◯人気 〇〇 56.0」みたいな行から騎手を拾う
-    """
     s = re.sub(r"\s+", " ", (text or "")).strip()
-    # 人気の後、斤量(##.#)の前にある日本語っぽいトークンを拾う
     m = re.search(r"\d+\s*人気.*?([^\s\d]{1,8})\s*(\d{2}\.\d)", s)
     if m:
         return m.group(1).strip()
-    # 斤量だけ見えてるパターン
     m = re.search(r"([^\s\d]{1,8})\s*(\d{2}\.\d)", s)
     if m:
         return m.group(1).strip()
@@ -349,16 +415,13 @@ def _parse_passing(z_cell):
         spans = [x for x in spans if x]
         if spans:
             return "-".join(spans)
-    # fallback
     s = z_cell.get_text(" ", strip=True) if z_cell else ""
     m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})*)", s)
     return m.group(1) if m else ""
 
 def _parse_one_history(z_cell, fallback_place, resources):
-    """
-    1走分をパースして dict で返す（取れない項目は空）
-    """
     z_text = z_cell.get_text(" ", strip=True) if z_cell else ""
+
     place, ymd = _parse_date_place(z_text, fallback_place)
     dist = _parse_dist(z_text)
     rank = _parse_rank(z_text)
@@ -366,7 +429,6 @@ def _parse_one_history(z_cell, fallback_place, resources):
     agari = _parse_agari(z_text)
     pas = _parse_passing(z_cell)
 
-    # 騎手：p.nk23_u-text10 の中から「人気」含む行優先
     j_prev = ""
     for p in z_cell.select("p.nk23_u-text10"):
         pt = p.get_text(" ", strip=True)
@@ -375,7 +437,6 @@ def _parse_one_history(z_cell, fallback_place, resources):
             if j_prev:
                 break
     if not j_prev:
-        # fallback：とにかく斤量の前の文字を拾う
         for p in z_cell.select("p.nk23_u-text10"):
             pt = p.get_text(" ", strip=True)
             j_prev = _parse_jockey_from_pop_line(pt)
@@ -386,7 +447,7 @@ def _parse_one_history(z_cell, fallback_place, resources):
 
     return {
         "place": place,
-        "ymd": ymd,
+        "ymd": (ymd or "").replace("着", "").strip(),  # ★保険
         "dist": dist,
         "rank": rank,
         "pop": pop,
@@ -441,14 +502,6 @@ def parse_nankankeiba_detail(html, place_name, resources):
             j_full = normalize_name(j_raw, resources["jockeys"])
             t_full = normalize_name(t_raw, resources["trainers"])
 
-            # 現在P（数値）
-            curr_power_val = ""
-            p_data_now = resources["power_data"].get((place_name, j_full))
-            if p_data_now:
-                curr_power_val = str(p_data_now.get("power", ""))
-            # 表示用 P:xxx
-            power_info = resources["power"].get((place_name, j_full), f"P:{curr_power_val}" if curr_power_val else "P:不明")
-
             # 相性（AI2）
             ai2 = row.select_one("td.cs-ai2 .graph_text_div")
             pair_stats = "-"
@@ -461,8 +514,9 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
             # 過去3走
             history_strs = []
-            prev_power_val = ""               # 前走P（数値）
-            first_prev_jockey_full = ""       # 前走騎手（正規化）
+            prev_power_val = ""         # ★前走P（数値）
+            prev_place = ""             # ★前走の競馬場（正規化）
+            prev_jockey_full = ""       # ★前走騎手（正規化）
 
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
@@ -472,16 +526,16 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 one = _parse_one_history(z, place_name, resources)
 
                 if i == 1:
-                    first_prev_jockey_full = one["jockey_full"]
-                    # 前走P（前走の場所×前走騎手で引く）
-                    if one["place"] in ("船橋", "大井", "川崎", "浦和"):
-                        p_prev = resources["power_data"].get((one["place"], one["jockey_full"]))
-                        if p_prev and p_prev.get("power") not in (None, "", "-"):
-                            prev_power_val = str(p_prev["power"])
+                    prev_place = one["place"]
+                    prev_jockey_full = one["jockey_full"]
+                    # 前走P：前走の競馬場×前走騎手
+                    p_prev = resources["power_data"].get((prev_place, prev_jockey_full))
+                    if p_prev and str(p_prev.get("power", "")).strip():
+                        prev_power_val = str(p_prev["power"]).strip()
 
-                # 表示フォーマット
-                ymd = one["ymd"]
-                pl = one["place"]
+                # ★②「着」混入を絶対に出さない整形
+                ymd = (one["ymd"] or "").replace("着", "").strip()
+                pl = (one["place"] or "").replace("着", "").strip()
                 dist = one["dist"]
                 jk = one["jockey_full"]
                 pas = one["pas"] or "-"
@@ -489,26 +543,33 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 rk = one["rank"] or ""
                 pop = one["pop"] or ""
                 ag_part = f"{ag}" if ag else ""
+
                 history_strs.append(f"{ymd} {pl}{dist} {jk} {pas}({ag_part})→{rk}着({pop})")
 
-            # ★表示行をここで正しく作る（h 未定義バグを排除）
-            curr_p_display = curr_power_val if curr_power_val else power_info.replace("P:", "")
-            if prev_power_val and (j_full and first_prev_jockey_full and j_full != first_prev_jockey_full):
-                power_line = f"【騎手】{curr_p_display}(前P:{prev_power_val})、 相性:{pair_stats}"
-            else:
-                power_line = f"【騎手】{curr_p_display}、 相性:{pair_stats}"
+            # ★①【騎手】欄：今回騎手の(開催場×騎手)で P/勝率/複勝率、前走は近走1本目から前P
+            curr = resources["power_data"].get((place_name, j_full), {})
+            curr_p = str(curr.get("power", "")).strip()
+            curr_win = _format_rate(curr.get("win_rate"))
+            curr_fuku = _format_rate(curr.get("fuku_rate"))
+
+            p_disp = f"P:{curr_p}" if curr_p and curr_p not in ("-", "nan", "NaN") else "P:不明"
+            stats_part = f"（勝{curr_win}複{curr_fuku}）" if (curr_win or curr_fuku) else ""
+            prev_disp = prev_power_val if prev_power_val else "-"
+
+            power_line = f"【騎手】{p_disp}{stats_part} 前P:{prev_disp} 相性:{pair_stats}"
 
             data["horses"][umaban] = {
                 "name": horse_name,
                 "jockey": j_full,
                 "trainer": t_full,
-                "power": power_info,
                 "compat": pair_stats,
                 "hist": history_strs,
                 "display_power": power_line,
-                "curr_power_val": curr_power_val,
+
+                # 参考情報（デバッグ用に残す）
+                "prev_place": prev_place,
+                "prev_jockey_full": prev_jockey_full,
                 "prev_power_val": prev_power_val,
-                "first_prev_jockey_full": first_prev_jockey_full,
             }
 
         except Exception:
@@ -516,6 +577,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
     return data
 
+
+# ==================================================
+# 6. 対戦表（既存）
+# ==================================================
 def _parse_grades_from_ai(text):
     grades = {}
     for line in (text or "").split("\n"):
@@ -609,48 +674,38 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
     except Exception as e:
         return f"(対戦表取得エラー: {e})"
 
+
 # ==================================================
-# 5. ジェネレータ
+# 7. uma_shosai 遅延ロード対策（頑丈待機）
 # ==================================================
-def _force_shosai_loaded(driver, timeout=25):
+def _force_shosai_loaded(driver, timeout=28):
     """
-    uma_shosai の「過去走セル」が空でない状態まで待つ。
-    cs-z1 だけじゃなく cs-z3 も見る。必要ならスクロールでロードを促す。
+    uma_shosai の「過去走セル」が “空じゃない状態” まで待つ
+    - cs-z1 だけじゃなく cs-z3 も（あるなら）中身が入るまで待つ
     """
-    # 表示切替（存在すれば）
     try:
         driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
     except Exception:
         pass
 
-    def _ok(d):
-        # 要素の数＆中身（pのテキスト）をざっくり見る
-        z1 = d.find_elements(By.CSS_SELECTOR, "td.cs-z1")
-        z3 = d.find_elements(By.CSS_SELECTOR, "td.cs-z3")
-        if not z1:
-            return False
-        # cs-z3 が無いページもあるかもしれないので “あれば中身を見る”
-        def has_text(cells):
-            for c in cells[:6]:
-                tx = (c.text or "").strip()
-                if len(tx) >= 5:
-                    return True
-            return False
-
-        if not has_text(z1):
-            return False
-        if z3 and (not has_text(z3)):
-            return False
-        return True
+    def _has_text(cells):
+        for c in cells[:6]:
+            tx = (c.text or "").strip()
+            if len(tx) >= 5:
+                return True
+        return False
 
     end = time.time() + timeout
-    last_err = None
     while time.time() < end:
         try:
-            if _ok(driver):
-                return True
-        except Exception as e:
-            last_err = e
+            z1 = driver.find_elements(By.CSS_SELECTOR, "td.cs-z1")
+            z3 = driver.find_elements(By.CSS_SELECTOR, "td.cs-z3")
+
+            if z1 and _has_text(z1):
+                if (not z3) or _has_text(z3):
+                    return True
+        except Exception:
+            pass
 
         # 遅延ロード促進（下→上）
         try:
@@ -662,10 +717,15 @@ def _force_shosai_loaded(driver, timeout=25):
 
         time.sleep(0.6)
 
-    raise TimeoutException(f"詳細データの読み込みに失敗しました（timeout={timeout}s, last_err={last_err}）")
+    raise TimeoutException(f"詳細データの読み込みに失敗しました（timeout={timeout}s）")
 
-def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
+
+# ==================================================
+# 8. ジェネレータ（メイン）
+# ==================================================
+def run_races_iter(year, month, day, place_code, target_races, mode="dify"):
     resources = load_resources()
+
     kb_input_map = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     nk_code_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
 
@@ -687,6 +747,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
         prog_url = f"https://www.nankankeiba.com/program/{year}{month}{day}{nk_place_code}.do"
         driver.get(prog_url)
         soup = BeautifulSoup(driver.page_source, "html.parser")
+
         r_nums = []
         for a in soup.find_all("a", href=True):
             if f"{year}{month}{day}{nk_place_code}" in a["href"] and "uma_shosai" not in a["href"]:
@@ -709,12 +770,11 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
 
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
 
-                # uma_shosai へ
+                # uma_shosai
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 _force_shosai_loaded(driver, timeout=28)
 
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
-
                 if not nk_data["horses"]:
                     yield {"type": "error", "data": f"{r_num}R データなし"}
                     continue
@@ -728,25 +788,21 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 horse_texts = []
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
-                    power_line = h.get("display_power", h.get("power", "P:不明"))
 
                     block = [
                         f"[{u}]{h['name']} 騎:{h['jockey']} 師:{h['trainer']}",
                         f"話:{danwa.get(u,'なし')}",
                         f"調:{cyokyo.get(u,'データなし')}",
-                        power_line,
+                        h["display_power"],   # ★要望①の新表示
                         "【近走】",
                     ]
-                    for hs in h["hist"]:
-                        block.append(hs)
+                    block.extend(h["hist"])    # ★要望②：着混入なし
                     horse_texts.append("\n".join(block))
 
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
 
                 if mode == "raw":
-                    yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
-                    match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
-                    final_text = f"{full_prompt}\n\n{match_txt}\n\n詳細リンク: {result_url}"
+                    final_text = f"{full_prompt}\n\n詳細リンク: {result_url}"
                     yield {"type": "result", "race_num": r_num, "data": final_text}
                     time.sleep(1)
                     continue
