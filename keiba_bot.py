@@ -218,7 +218,6 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
     return d_danwa, d_cyokyo
 
 def parse_nankankeiba_detail(html, place_name, resources):
-    """南関競馬の詳細データ解析（正規表現バックアップ付き）"""
     soup = BeautifulSoup(html, "html.parser")
     data = {"meta": {}, "horses": {}}
     h3 = soup.find("h3", class_="nk23_c-tab1__title")
@@ -259,8 +258,8 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 pair_stats = f"勝{r}({w}/{t})"
             
             history = []
-            prev_power_info = "" # "前P:xx" という文字列
-            first_prev_jockey_full = "" # 1走前の騎手名(正規化後)
+            prev_power_info = "" # "前P:xx" 
+            first_prev_jockey_full = "" # 1走前騎手名(正規化後)
             
             for i in range(1, 4):
                 z = row.select_one(f"td.cs-z{i}")
@@ -336,11 +335,13 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
                 j_prev_full = normalize_name(j_prev, resources["jockeys"])
                 
-                # 1走前（i==1）の場合のみ、P値と騎手名を保持
+                # 1走前データの保存
                 if i == 1:
                     first_prev_jockey_full = j_prev_full
                     p_data = resources["power_data"].get((place_short, j_prev_full))
-                    if p_data: prev_power_info = f"前P:{p_data['power']}"
+                    # 前Pがある場合のみ文字列化
+                    if p_data:
+                        prev_power_info = f"前P:{p_data['power']}"
 
                 h_str = f"{ymd} {course_s} {r_cl} {j_prev_full} {pas}({agari})→{rank}着({pop})"
                 history.append(h_str)
@@ -348,10 +349,10 @@ def parse_nankankeiba_detail(html, place_name, resources):
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
                 "power": power_info, 
-                "prev_power": prev_power_info, # "前P:xx"
-                "first_prev_jockey": first_prev_jockey_full, # 1走前騎手名(正規化済)
+                "prev_power": prev_power_info, 
+                "first_prev_jockey": first_prev_jockey_full, 
                 "compat": pair_stats, "hist": history, 
-                "prev_jockey_name": history[0].split(" ")[3] if history else "" # backup
+                "prev_jockey_name": history[0].split(" ")[3] if history else "" 
             }
         except Exception: continue
     return data
@@ -382,13 +383,16 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                     link = col.find('a')
                     href = link.get('href','')
                     full_url = ""
+                    # リンク修正ロジック (ID抽出)
                     if href:
-                        if href.startswith('..'):
-                            full_url = "https://www.nankankeiba.com" + href[2:]
+                        # "javascript:openMovie..." からID(数字列)を抽出
+                        id_match = re.search(r"(\d{10,})", href)
+                        if id_match:
+                            full_url = f"https://www.nankankeiba.com/result/{id_match.group(1)}.do"
                         elif href.startswith('/'):
                             full_url = "https://www.nankankeiba.com" + href
                         else:
-                            full_url = "https://www.nankankeiba.com/result/" + href
+                            full_url = href
 
                     races.append({
                         "title": det.get_text(" ", strip=True),
@@ -432,6 +436,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
             for x in r["results"]:
                 g = f"[{x['grade']}]" if x['grade'] else ""
                 line_parts.append(f"{x['rank']}着 {x['name']}{g}")
+            # リザルトURLを含めて出力
             out.append(f"◆ {r['title']}\n" + " / ".join(line_parts) + (f"\nLink: {r['url']}" if r['url'] else ""))
             
         return "\n".join(out)
@@ -494,16 +499,23 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 for u in sorted(nk_data["horses"].keys(), key=int):
                     h = nk_data["horses"][u]
                     
-                    # 騎手情報構築 (乗り替わり判定)
+                    # 騎手情報構築 (乗り替わり判定ロジック強化)
                     p_jockey = h.get("prev_jockey_name", "")
                     p_info = f"(前:{p_jockey})" if p_jockey else ""
                     
-                    curr_p = h['power']
-                    prev_p_str = h['prev_power'] # "前P:5"
+                    curr_p = h['power'] # "P:5" 形式
+                    prev_p_str = h['prev_power'] # "前P:3" 形式
                     
-                    # 今回騎手と1走前騎手が違い、かつ前Pがある場合のみ表示
-                    if h['jockey'] != h['first_prev_jockey'] and prev_p_str:
-                        # 例: P:5(前P:3)、 相性...
+                    # P値の部分だけ抽出して比較 (文字列操作)
+                    # "P:5" -> "5"
+                    curr_p_val = re.sub(r"[^0-9\.]", "", curr_p)
+                    prev_p_val = re.sub(r"[^0-9\.]", "", prev_p_str)
+                    
+                    # 今回と前回の騎手名が違い、かつ前Pが存在する場合のみ表示
+                    # ※ normalize_name で比較するのが確実
+                    is_change = (h['jockey'] != h['first_prev_jockey'])
+                    
+                    if is_change and prev_p_str:
                         power_line = f"【騎手】{curr_p}({prev_p_str})、 相性:{h['compat']}"
                     else:
                         power_line = f"【騎手】{curr_p}、 相性:{h['compat']}"
