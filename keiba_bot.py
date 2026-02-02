@@ -815,8 +815,8 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                        f"[{u}]{h['name']} 騎:{jockey_disp} 師:{h['trainer']}",
                        f"話:{danwa.get(u,'なし')}",
                        f"調:{cyokyo.get(u,'データなし')}",
-                    　　 power_line,
-                         "【近走】"
+                    　 power_line,
+                       "【近走】"
                     ]
 
                     for idx, hs in enumerate(h["hist"]):
