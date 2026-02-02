@@ -600,7 +600,49 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
 
     return d_danwa, d_cyokyo
 
+# ==================================================
+# 7.5 Dify出力 × Python調教 注入ユーティリティ ★追加
+# ==================================================
+def _flatten_for_md_cell(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", " / ")
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    s = s.replace("|", "｜")
+    return s
 
+
+def inject_python_cyokyo_into_ai_table(ai_text: str, cyokyo: dict) -> str:
+    if not ai_text:
+        return ai_text
+
+    lines = ai_text.splitlines()
+    out = []
+
+    for line in lines:
+        s = line.strip()
+        if not s.startswith("|"):
+            out.append(line)
+            continue
+
+        cols = [c.strip() for c in s.strip("|").split("|")]
+
+        if len(cols) < 4 or cols[0] in ("馬番", "---"):
+            out.append(line)
+            continue
+
+        umaban = cols[0]
+
+        if umaban.isdigit() and umaban in cyokyo:
+            cy = _flatten_for_md_cell(cyokyo.get(umaban, ""))
+            if cy:
+                cols[2] = cols[2].rstrip() + f" 【調教】{cy}"
+
+        out.append("| " + " | ".join(cols) + " |")
+
+    return "\n".join(out)
 # ==================================================
 # 8. Dify出力からランク抽出（JSONでもMarkdownでもOK）
 # ==================================================
