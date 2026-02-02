@@ -601,102 +601,109 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
     return d_danwa, d_cyokyo
 
 # ==================================================
-# 7.5 Dify出力 × Python調教 注入ユーティリティ ★完全版（確実に動く）
+# 7.5 Dify出力 × Python調教 注入（ランク列の直前に確実に入れる版）
 # ==================================================
 def _flatten_for_md_cell(s: str) -> str:
-    """
-    Markdown表セルを壊さないための1行化
-    - 改行 → " / "
-    - '|' → 全角 '｜'
-    """
     if s is None:
         return ""
     s = str(s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\n", " / ")
     s = re.sub(r"\s{2,}", " ", s).strip()
-    s = s.replace("|", "｜")
+    s = s.replace("|", "｜")  # セル破壊防止
     return s
 
 
-def inject_cyokyo_after_each_horse(ai_text: str, cyokyo: dict) -> str:
+def _split_md_row_4cols_safe(line: str):
     """
-    Dify出力（Markdown表）について、
-    各行の「スコア・詳細」列の末尾に【調教】(Python取得)を追記する。
-    → 各馬の評価直後に調教がつながる（最も確実）
+    Markdown表の1行を「4列」として安全に分解する。
+    途中の本文に '|' が含まれても壊さない。
+    戻り値: (col1, col2, col3, col4) or None
+    """
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+
+    # 両端の '|' を落とす（末尾に無いケースもあるのでrstripはしない）
+    core = s[1:]
+    # 末尾に '|' があるなら外す
+    if core.endswith("|"):
+        core = core[:-1]
+
+    # 最初の2つの区切り '|' の位置
+    p1 = core.find("|")
+    if p1 == -1:
+        return None
+    p2 = core.find("|", p1 + 1)
+    if p2 == -1:
+        return None
+
+    # 最後の区切り（ランク列の前）
+    plast = core.rfind("|")
+    if plast == -1 or plast <= p2:
+        return None
+
+    c1 = core[:p1].strip()
+    c2 = core[p1 + 1:p2].strip()
+    c3 = core[p2 + 1:plast].strip()   # ←ここは '|' を含んでもOK（本文全体）
+    c4 = core[plast + 1:].strip()
+
+    return c1, c2, c3, c4
+
+
+def inject_cyokyo_before_rank(ai_text: str, cyokyo: dict) -> str:
+    """
+    各馬行の「スコア・詳細（3列目）」の末尾に【調教】を追記する。
+    → 結果として、行末の「| ランク |」の直前に必ず【調教】が入る。
     """
     if not ai_text:
         return ai_text
 
-    # 念のため cyokyo のキーを全部 str に寄せる
-    cyokyo_map = {}
-    try:
-        for k, v in (cyokyo or {}).items():
-            cyokyo_map[str(k).strip()] = v
-    except Exception:
-        cyokyo_map = cyokyo or {}
+    cy_map = {str(k).strip(): v for k, v in (cyokyo or {}).items()}
 
-    lines = ai_text.splitlines()
     out = []
-    table_row_touched = 0
-
-    for line in lines:
+    for line in ai_text.splitlines():
         s = line.strip()
 
-        # 表行じゃないならそのまま
+        # 表じゃない行はそのまま
         if not s.startswith("|"):
             out.append(line)
             continue
 
-        cols = [c.strip() for c in s.strip("|").split("|")]
-
-        # 罫線行 or 列不足はそのまま
-        if len(cols) < 4:
-            out.append(line)
-            continue
+        # 罫線行はそのまま
         if set(s.replace("|", "").strip()) <= set("-: "):
             out.append(line)
             continue
 
-        # ヘッダ行はそのまま
-        if cols[0] in ("馬番", "馬 番", "#", "No", "No.", "番号"):
+        cols = _split_md_row_4cols_safe(line)
+        if not cols:
+            # 想定外の表行 → そのまま
             out.append(line)
             continue
 
-        # 1列目から馬番（数字）抽出
-        m = re.search(r"\d+", cols[0])
+        c1, c2, c3, c4 = cols
+
+        # ヘッダ行はそのまま
+        if c1 in ("馬番", "馬 番", "#", "No", "No.", "番号"):
+            out.append(line)
+            continue
+
+        # 馬番抽出
+        m = re.search(r"\d+", c1)
         umaban = m.group(0) if m else ""
 
-        # 馬番が取れて、cyokyoがあれば「3列目（スコア・詳細）」に追記
-        if umaban and umaban in cyokyo_map:
-            cy = _flatten_for_md_cell(cyokyo_map.get(umaban, ""))
+        # 調教追記（ランク列の直前＝3列目の末尾）
+        if umaban and umaban in cy_map:
+            cy = _flatten_for_md_cell(cy_map.get(umaban, ""))
             if cy:
-                # 3列目（index=2）が「スコア・詳細」想定
-                cols[2] = (cols[2].rstrip() + f" 【調教】{cy}").strip()
-                table_row_touched += 1
+                # すでに【調教】が入ってたら二重に入れない
+                if "【調教】" not in c3:
+                    c3 = (c3.rstrip() + f" 【調教】{cy}").strip()
 
-        out.append("| " + " | ".join(cols) + " |")
-
-    # 表として1行も触れなかった場合のフォールバック（表崩れ・別形式対策）
-    if table_row_touched == 0:
-        # 「| 1 |」のような行が無い or 列の構造が違う可能性があるので、
-        # 馬番の見出しっぽいパターンでの追記を試みる（最低限）
-        text = ai_text
-        for umaban, cy in cyokyo_map.items():
-            cy = _flatten_for_md_cell(cy)
-            if not cy:
-                continue
-            # 例: "[1]" または "1 " などが単独で出るケース
-            # ※過剰置換を避けるため、まず "[{umaban}]" のみに限定
-            text = re.sub(
-                rf"(\[{re.escape(umaban)}\].*?$)",
-                rf"\1 【調教】{cy}",
-                text,
-                flags=re.MULTILINE
-            )
-        return text
+        out.append(f"| {c1} | {c2} | {c3} | {c4} |")
 
     return "\n".join(out)
+
 
 # ==================================================
 # 8. Dify出力からランク抽出（JSONでもMarkdownでもOK）
@@ -1009,8 +1016,8 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 ai_out_clean = re.sub(r"^\s*-{3,}\s*$", "", ai_text, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r"\n{3,}", "\n\n", ai_out_clean).strip()
 
-                # cyokyo は parse_kb_danwa_cyokyo() で取った dict（馬番->調教テキスト）
-                ai_out_clean = inject_cyokyo_after_each_horse(ai_out_clean, cyokyo)
+                ai_out_clean = inject_cyokyo_before_rank(ai_out_clean, cyokyo)
+
 
                 final_text = (
                     f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
