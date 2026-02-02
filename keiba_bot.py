@@ -754,19 +754,28 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                     if rnk and (rnk.isdigit() or rnk in ["除外", "中止"]):
                         races[i]["results"].append({"rank": rnk, "name": name, "grade": grade, "sort": int(rnk) if rnk.isdigit() else 999})
 
-        out = ["\n【対戦表（AI評価付き）】"]
-        for r in races:
-            if not r["results"]:
-                continue
-            r["results"].sort(key=lambda x: x["sort"])
-            line_parts = []
-for x in r["results"]:
-    g = f"({x['grade']})" if x.get("grade") else ""
-    line_parts.append(f"{x['rank']}着 {x['name']}{g}")
+                out = ["\n【対戦表（AI評価付き）】"]
+                for r in races:
+                    if not r.get("results"):
+                        continue
+    
+                    r["results"].sort(key=lambda x: x.get("sort", 999))
 
-        return "\n".join(out)
-    except Exception as e:
-        return f"(対戦表取得エラー: {e})"
+                    line_parts = []
+                    for x in r["results"]:
+                        g = f"({x['grade']})" if x.get("grade") else ""
+                        line_parts.append(f"{x['rank']}着 {x['name']}{g}")
+
+                    # タイトル + 結果行 を out に追加
+                    if line_parts:
+                        title = r.get("title", "")
+                        out.append(f"◆ {title}\n" + " / ".join(line_parts) + (f"\nLink: {r['url']}" if r.get("url") else ""))
+
+                # 1レースも結果がない場合
+                if len(out) == 1:
+                    return "\n(初対戦)"
+
+                return "\n".join(out)
 
 # ==================================================
 # 6. ジェネレータ
