@@ -341,6 +341,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
 
             history = []
             prev_power_val = None
+            prev_jockey_latest = ""  
 
             # --- 近走データ (最大3走) ---
             for i in range(1, 4):
@@ -435,13 +436,14 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 if not j_prev_full and j_prev:
                     j_prev_full = j_prev
 
-                # ★ 前走(i=1)のP取得 ★
+                # ★ 前走(i=1)の騎手＆P取得 ★
                 if i == 1:
+                    prev_jockey_latest = j_prev_full  # ★追加：前走騎手（近走の最新）
                     p_key = (place_short, j_prev_full)
                     p_data_prev = resources["power_data"].get(p_key)
                     if p_data_prev:
-                        prev_power_val = p_data_prev["power"]
-
+                        prev_power_val = p_data_prev["power"]                
+        
                 # ==================================================
                 # ★ 文字列生成 (修正：着順の表示分け)
                 # ==================================================
@@ -468,6 +470,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             data["horses"][umaban] = {
                 "name": horse_name, "jockey": j_full, "trainer": t_full,
                 "power": curr_power_str,
+                "prev_jockey": prev_jockey_latest,
                 "compat": pair_stats, "hist": history,
                 "display_power": power_line
             }
@@ -797,13 +800,25 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
 
                     power_line = h.get("display_power", f"【騎手】{h['power']}、 相性:{h['compat']}")
 
+                    curr_j = (h.get("jockey") or "").strip()
+                    prev_j = (h.get("prev_jockey") or "").strip()
+
+                    if prev_j:
+                        if curr_j == prev_j:
+                            jockey_disp = f"{curr_j}(同)"
+                        else:
+                            jockey_disp = f"{curr_j}←{prev_j}"
+                    else:
+                        jockey_disp = curr_j  # 前走が取れないときはそのまま
+
                     block = [
-                        f"[{u}]{h['name']} 騎:{h['jockey']} 師:{h['trainer']}",
-                        f"話:{danwa.get(u,'なし')}",
-                        f"調:{cyokyo.get(u,'データなし')}",
-                        power_line,
-                        "【近走】"
+                       f"[{u}]{h['name']} 騎:{jockey_disp} 師:{h['trainer']}",
+                       f"話:{danwa.get(u,'なし')}",
+                       f"調:{cyokyo.get(u,'データなし')}",
+                    　　 power_line,
+                         "【近走】"
                     ]
+
                     for idx, hs in enumerate(h["hist"]):
                         block.append(f"{hs}")
                     horse_texts.append("\n".join(block))
