@@ -513,7 +513,7 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
         if "login" in driver.current_url:
             if login_keibabook_robust(driver):
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{kb_id}")
-        
+
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tbl in soup.select("table.danwa"):
             curr = None
@@ -531,10 +531,22 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
 
         # --- 調教 (Cyokyo) ---
         driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
+        if "login" in driver.current_url:
+            if login_keibabook_robust(driver):
+                driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{kb_id}")
+
+        # ✅ ページロード待ち（最低限 table が出るまで）
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table.default.cyokyo"))
+            )
+        except Exception:
+            pass
+
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
-        # 1頭ごとに table.cyokyo が分かれている構造
-        for tbl in soup.select("table.cyokyo"):
+        # 1頭ごとに table.default.cyokyo が分かれている構造
+        for tbl in soup.select("table.default.cyokyo"):
             try:
                 # 馬番取得
                 u_td = tbl.select_one("td.umaban")
@@ -546,34 +558,29 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                 tp_td = tbl.select_one("td.tanpyo")
                 tp_txt = tp_td.get_text(strip=True) if tp_td else ""
 
-                # 詳細データ取得（2行目の td 内にある）
-                rows = tbl.find_all("tr")
-                if len(rows) < 2:
+                # ✅ ここが修正点：
+                # thead を避けるため tbody の tr だけ取得
+                tbody_rows = tbl.select("tbody tr")
+                if len(tbody_rows) < 2:
                     d_cyokyo[uma] = f"【短評】{tp_txt}"
                     continue
 
-                content_td = rows[1].find("td")
+                # 2行目が詳細（<td colspan="5"> ... dl-table と table.cyokyodata ...）
+                content_td = tbody_rows[1].find("td")
                 if not content_td:
                     d_cyokyo[uma] = f"【短評】{tp_txt}"
                     continue
 
                 cyokyo_lines = []
-                
+
                 # dl (ヘッダ) と table (タイム) が交互に並んでいる
-                # dlクラスを持つ要素を全て取得し、その直後のテーブルを探す
                 dls = content_td.select("dl.dl-table")
-                
+
                 for dl in dls:
                     # --- ラベル判定（前走 vs 今走） ---
-                    # 最初の dt タグの中身を確認
                     first_dt = dl.find("dt")
                     first_dt_text = first_dt.get_text(strip=True) if first_dt else ""
-                    
-                    if "(前回)" in first_dt_text:
-                        label = "前走向け調教"
-                    else:
-                        # 空白やそれ以外の場合は今走扱い
-                        label = "今走向け調教"
+                    label = "前走向け調教" if "(前回)" in first_dt_text else "今走向け調教"
 
                     # --- 日付・場所・馬場状態 ---
                     dt_left = dl.select_one("dt.left")
@@ -581,30 +588,34 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                     dt_right = dl.select_one("dt.right")
                     cond_text = dt_right.get_text(strip=True) if dt_right else ""
 
-                    # --- タイムデータ (直後の兄弟要素の table を探す) ---
+                    # --- タイムデータ（dl の次の table.cyokyodata を拾う）---
                     next_node = dl.find_next_sibling()
-                    while next_node and next_node.name != 'table':
+                    while next_node and next_node.name != "table":
                         next_node = next_node.find_next_sibling()
-                    
+
                     time_data = ""
-                    if next_node and "cyokyodata" in next_node.get("class", []):
-                        # テーブル内のテキストを行ごとに取得
+                    if next_node and "cyokyodata" in (next_node.get("class") or []):
                         data_rows = []
                         for tr in next_node.select("tr"):
-                            # タイムや併せ馬情報の取得
-                            cells = [td.get_text(strip=True) for td in tr.find_all("td") if td.get_text(strip=True)]
+                            cells = [
+                                td.get_text(strip=True)
+                                for td in tr.find_all("td")
+                                if td.get_text(strip=True)
+                            ]
                             if cells:
                                 data_rows.append(" ".join(cells))
                         time_data = " / ".join(data_rows)
 
-                    # 行を作成: "前走向け調教：12/26 浦和調教場 重 馬なり 59.2 42.8"
-                    cyokyo_lines.append(f"{label}：{info_text} {cond_text} {time_data}")
+                    # 文字列（空が多いときは余計なスペースを詰める）
+                    line = f"{label}：{info_text} {cond_text} {time_data}".strip()
+                    line = re.sub(r"\s{2,}", " ", line)
+                    cyokyo_lines.append(line)
 
-                # 最終的な文字列生成
-                full_text = f"【短評】{tp_txt}"
+                # 最終テキスト
+                full_text = f"【短評】{tp_txt}".strip()
                 if cyokyo_lines:
                     full_text += "\n" + "\n".join(cyokyo_lines)
-                
+
                 d_cyokyo[uma] = full_text
 
             except Exception:
@@ -612,7 +623,7 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
 
     except Exception:
         pass
-    
+
     return d_danwa, d_cyokyo
 
 def _parse_grades_from_ai(text):
