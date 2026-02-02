@@ -629,14 +629,62 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
 
     return d_danwa, d_cyokyo
 
-def _parse_grades_from_ai(text):
+def _parse_grades_from_ai(ai_out: str):
+    """
+    Difyの出力から {馬名: ランク(S/A/B/C/D/E/F/G)} を抽出する。
+    - ai_out が JSON文字列 {"text": "..."} 形式でもOK
+    - Markdown表（| ... | ... | ... | S |）からも抽出
+    """
     grades = {}
-    for line in text.split("\n"):
-        m = re.search(r"([SABCDE])\s*[:：]?\s*([^\s　]+)", line)
-        if m:
-            g, n = m.group(1), re.sub(r"[（\(].*?[）\)]", "", m.group(2)).strip()
-            if n:
-                grades[n] = g
+
+    # 1) JSON文字列っぽい場合は text を取り出す
+    text = ai_out or ""
+    try:
+        j = json.loads(text)
+        if isinstance(j, dict) and "text" in j and isinstance(j["text"], str):
+            text = j["text"]
+    except Exception:
+        pass
+
+    # 2) Markdown表の行を拾う（例：| 1 | リノデスティーノ (岡村健司) | ... | S |）
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        if set(line.replace("|", "").strip()) <= set("-: "):
+            continue  # 区切り行（|---|---|）除外
+
+        cols = [c.strip() for c in line.strip("|").split("|")]
+        if len(cols) < 4:
+            continue
+
+        # 最終列がランク
+        rank = cols[-1].strip()
+        if not re.fullmatch(r"[SABCDEFG]", rank):
+            continue
+
+        # 2列目が「馬名・騎手(乗替)」想定
+        name_col = cols[1]
+
+        # 馬名だけ抜く：括弧の前まで
+        horse = re.split(r"\s*[\(（]", name_col, maxsplit=1)[0].strip()
+        # 余計な装飾除去
+        horse = re.sub(r"[*_`]", "", horse).strip()
+
+        if horse:
+            grades[horse] = rank
+
+    # 3) フォールバック：本文に「| ... | ... | ... | S |」が無いとき用（簡易）
+    #   既存の「S:馬名」形式も拾えるように残しておく
+    if not grades:
+        for line in text.split("\n"):
+            m = re.search(r"([SABCDEFG])\s*[:：]?\s*([^\s　|]+)", line)
+            if m:
+                g = m.group(1)
+                n = re.sub(r"[（\(].*?[）\)]", "", m.group(2)).strip()
+                if n:
+                    grades[n] = g
+
     return grades
 
 def _fetch_matchup_table_selenium(driver, nankan_id, grades):
@@ -712,10 +760,9 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                 continue
             r["results"].sort(key=lambda x: x["sort"])
             line_parts = []
-            for x in r["results"]:
-                g = f"[{x['grade']}]" if x["grade"] else ""
-                line_parts.append(f"{x['rank']}着 {x['name']}{g}")
-            out.append(f"◆ {r['title']}\n" + " / ".join(line_parts) + (f"\nLink: {r['url']}" if r["url"] else ""))
+for x in r["results"]:
+    g = f"({x['grade']})" if x.get("grade") else ""
+    line_parts.append(f"{x['rank']}着 {x['name']}{g}")
 
         return "\n".join(out)
     except Exception as e:
