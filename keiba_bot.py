@@ -1,4 +1,4 @@
-# keiba_bot.py
+            # keiba_bot.py
 import time
 import re
 import os
@@ -601,10 +601,15 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
     return d_danwa, d_cyokyo
 
 # ==================================================
-# 7.5 Dify出力 × Python調教 注入ユーティリティ ★追加
+# 7.5 Dify出力 × Python調教 注入ユーティリティ ★完全版（確実に動く）
 # ==================================================
 def _flatten_for_md_cell(s: str) -> str:
-    if not s:
+    """
+    Markdown表セルを壊さないための1行化
+    - 改行 → " / "
+    - '|' → 全角 '｜'
+    """
+    if s is None:
         return ""
     s = str(s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -614,35 +619,85 @@ def _flatten_for_md_cell(s: str) -> str:
     return s
 
 
-def inject_python_cyokyo_into_ai_table(ai_text: str, cyokyo: dict) -> str:
+def inject_cyokyo_after_each_horse(ai_text: str, cyokyo: dict) -> str:
+    """
+    Dify出力（Markdown表）について、
+    各行の「スコア・詳細」列の末尾に【調教】(Python取得)を追記する。
+    → 各馬の評価直後に調教がつながる（最も確実）
+    """
     if not ai_text:
         return ai_text
 
+    # 念のため cyokyo のキーを全部 str に寄せる
+    cyokyo_map = {}
+    try:
+        for k, v in (cyokyo or {}).items():
+            cyokyo_map[str(k).strip()] = v
+    except Exception:
+        cyokyo_map = cyokyo or {}
+
     lines = ai_text.splitlines()
     out = []
+    table_row_touched = 0
 
     for line in lines:
         s = line.strip()
+
+        # 表行じゃないならそのまま
         if not s.startswith("|"):
             out.append(line)
             continue
 
         cols = [c.strip() for c in s.strip("|").split("|")]
 
-        if len(cols) < 4 or cols[0] in ("馬番", "---"):
+        # 罫線行 or 列不足はそのまま
+        if len(cols) < 4:
+            out.append(line)
+            continue
+        if set(s.replace("|", "").strip()) <= set("-: "):
             out.append(line)
             continue
 
-        umaban = cols[0]
+        # ヘッダ行はそのまま
+        if cols[0] in ("馬番", "馬 番", "#", "No", "No.", "番号"):
+            out.append(line)
+            continue
 
-        if umaban.isdigit() and umaban in cyokyo:
-            cy = _flatten_for_md_cell(cyokyo.get(umaban, ""))
+        # 1列目から馬番（数字）抽出
+        m = re.search(r"\d+", cols[0])
+        umaban = m.group(0) if m else ""
+
+        # 馬番が取れて、cyokyoがあれば「3列目（スコア・詳細）」に追記
+        if umaban and umaban in cyokyo_map:
+            cy = _flatten_for_md_cell(cyokyo_map.get(umaban, ""))
             if cy:
-                cols[2] = cols[2].rstrip() + f" 【調教】{cy}"
+                # 3列目（index=2）が「スコア・詳細」想定
+                cols[2] = (cols[2].rstrip() + f" 【調教】{cy}").strip()
+                table_row_touched += 1
 
         out.append("| " + " | ".join(cols) + " |")
 
+    # 表として1行も触れなかった場合のフォールバック（表崩れ・別形式対策）
+    if table_row_touched == 0:
+        # 「| 1 |」のような行が無い or 列の構造が違う可能性があるので、
+        # 馬番の見出しっぽいパターンでの追記を試みる（最低限）
+        text = ai_text
+        for umaban, cy in cyokyo_map.items():
+            cy = _flatten_for_md_cell(cy)
+            if not cy:
+                continue
+            # 例: "[1]" または "1 " などが単独で出るケース
+            # ※過剰置換を避けるため、まず "[{umaban}]" のみに限定
+            text = re.sub(
+                rf"(\[{re.escape(umaban)}\].*?$)",
+                rf"\1 【調教】{cy}",
+                text,
+                flags=re.MULTILINE
+            )
+        return text
+
     return "\n".join(out)
+
 # ==================================================
 # 8. Dify出力からランク抽出（JSONでもMarkdownでもOK）
 # ==================================================
@@ -950,10 +1005,12 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 except Exception:
                     pass
 
+                # 余計な罫線/空行を軽く整形
                 ai_out_clean = re.sub(r"^\s*-{3,}\s*$", "", ai_text, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r"\n{3,}", "\n\n", ai_out_clean).strip()
-                ai_out_clean = inject_python_cyokyo_into_ai_table(ai_out_clean, cyokyo)
 
+                # cyokyo は parse_kb_danwa_cyokyo() で取った dict（馬番->調教テキスト）
+                ai_out_clean = inject_cyokyo_after_each_horse(ai_out_clean, cyokyo)
 
                 final_text = (
                     f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
@@ -963,6 +1020,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
 
                 yield {"type": "result", "race_num": r_num, "data": final_text}
                 time.sleep(15)
+
 
             except Exception as e:
                 yield {"type": "error", "data": f"{r_num}R Error: {e}"}
