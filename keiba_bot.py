@@ -811,17 +811,17 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 full_prompt = header + "\n\n" + "\n\n".join(horse_texts)
 
                 if mode == "raw":
-                yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
-                match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
+                   yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
+                   match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
 
-                final_text = (
-                    f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
-                    f"=== 🔍RAW入力 ===\n{full_prompt}\n\n"
-                    f"{match_txt}"
-                )
-                yield {"type": "result", "race_num": r_num, "data": final_text}
-                time.sleep(1)
-                continue
+                   final_text = (
+                       f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
+                       f"=== 🔍RAW入力 ===\n{full_prompt}\n\n"
+                       f"{match_txt}"
+                   )
+                   yield {"type": "result", "race_num": r_num, "data": final_text}
+                   time.sleep(1)
+                   continue
 
                 yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
                 ai_out = run_dify_prediction(full_prompt)
