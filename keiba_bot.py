@@ -952,6 +952,8 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
 
                 ai_out_clean = re.sub(r"^\s*-{3,}\s*$", "", ai_text, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r"\n{3,}", "\n\n", ai_out_clean).strip()
+                ai_out_clean = inject_python_cyokyo_into_ai_table(ai_out_clean, cyokyo)
+
 
                 final_text = (
                     f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
