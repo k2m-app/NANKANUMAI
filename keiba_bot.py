@@ -855,8 +855,8 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
 				grade = grades.get(name_norm, "")
 
 				if not grade:
-  				  for k_norm, v in grades.items():
-   				     if k_norm and (k_norm in name_norm or name_norm in k_norm):
+  				　  for k_norm, v in grades.items():
+   				　      if k_norm and (k_norm in name_norm or name_norm in k_norm):
     				        grade = v
     				        break
 
