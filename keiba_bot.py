@@ -848,19 +848,22 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                 if not u:
                     continue
 
-                # --- 修正箇所: root = true を削除し、インデントを整理 ---
+                # === 修正箇所: ここを堅牢にしました ===
                 name = u.get_text(strip=True)
+
+                # gradesが None の場合の対策
+                safe_grades = grades if isinstance(grades, dict) else {}
 
                 # grade を付与（正規化完全一致 → 正規化部分一致）
                 name_norm = _norm_horse_name(name)
-                grade = grades.get(name_norm, "")
+                grade = safe_grades.get(name_norm, "")
 
-                if not grade:
-                    for k_norm, v in grades.items():
+                if not grade and name_norm:
+                    for k_norm, v in safe_grades.items():
                         if k_norm and (k_norm in name_norm or name_norm in k_norm):
                             grade = v
                             break
-                # ----------------------------------------------------
+                # ========================================
 
                 cells = tr.find_all(["td", "th"])
                 idx_st = -1
@@ -888,7 +891,7 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                             "sort": int(rnk) if rnk.isdigit() else 999
                         })
 
-        # ===== ここから「整形」：tbody ループの外でやる（重要）=====
+        # ===== 整形処理 =====
         out = ["\n【対戦表（AI評価付き）】"]
 
         for r in races:
