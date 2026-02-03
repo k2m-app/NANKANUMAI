@@ -562,7 +562,7 @@ def parse_kb_danwa_cyokyo(driver, kb_id):
                 for dl in dls:
                     first_dt = dl.find("dt")
                     first_dt_text = first_dt.get_text(strip=True) if first_dt else ""
-                    label = "前走向け調教" if "(前回)" in first_dt_text else "今走向け調教"
+                    label = "前走調教" if "(前回)" in first_dt_text else "今走調教"
 
                     dt_left = dl.select_one("dt.left")
                     info_text = dt_left.get_text(" ", strip=True) if dt_left else ""
