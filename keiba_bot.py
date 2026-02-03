@@ -708,10 +708,33 @@ def inject_cyokyo_before_rank(ai_text: str, cyokyo: dict) -> str:
 # ==================================================
 # 8. Dify出力からランク抽出（JSONでもMarkdownでもOK）
 # ==================================================
+import unicodedata
+
+def _norm_horse_name(s: str) -> str:
+    """
+    馬名照合用に正規化（NFKC + 空白除去 + 括弧書き除去 + 記号除去）
+    """
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.strip()
+    # 全角/半角スペースを含む空白を全部落とす（馬名は基本スペース無し想定）
+    s = re.sub(r"\s+", "", s.replace("　", " "))
+    # 括弧内の注記を除去
+    s = re.sub(r"[（(].*?[）)]", "", s)
+    # 表装飾系を軽く除去
+    s = re.sub(r"[*_`]", "", s)
+    return s
+
 def _parse_grades_from_ai(ai_out: str):
+    """
+    Dify出力（JSON/Markdown/パイプ区切り）から馬名→ランク(S～G)を抽出して返す。
+    返すdictのキーは _norm_horse_name() 済み。
+    """
     grades = {}
 
     text = ai_out or ""
+
     # JSON {"text": "..."} 形式なら展開
     try:
         j = json.loads(text)
@@ -720,15 +743,30 @@ def _parse_grades_from_ai(ai_out: str):
     except Exception:
         pass
 
-    # Markdown表から抽出（最後列が S〜G）
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("|"):
-            continue
-        if set(line.replace("|", "").strip()) <= set("-: "):
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
 
-        cols = [c.strip() for c in line.strip("|").split("|")]
+        # パイプ区切りっぽくない行はスキップ
+        if "|" not in line:
+            continue
+
+        # 罫線行（---|--- 等）っぽいのは除外
+        tmp = line.replace("|", "").strip()
+        if tmp and set(tmp) <= set("-: "):
+            continue
+
+        # 先頭/末尾に | があってもなくてもOKにする
+        core = line
+        if core.startswith("|"):
+            core = core[1:]
+        if core.endswith("|"):
+            core = core[:-1]
+
+        cols = [c.strip() for c in core.split("|")]
+
+        # 最低4列（馬番 / 馬名・騎手 / スコア / ランク）想定
         if len(cols) < 4:
             continue
 
@@ -736,23 +774,26 @@ def _parse_grades_from_ai(ai_out: str):
         if not re.fullmatch(r"[SABCDEFG]", rank):
             continue
 
-        name_col = cols[1]
-        horse = re.split(r"\s*[\(（]", name_col, maxsplit=1)[0].strip()
-        horse = re.sub(r"[*_`]", "", horse).strip()
+        name_cell = cols[1]
+
+        # 「馬名 騎:～～」形式を想定して馬名だけ抜く（騎: 以前を馬名とみなす）
+        horse = re.split(r"\s*騎[:：]", name_cell, maxsplit=1)[0].strip()
+        horse = _norm_horse_name(horse)
         if horse:
             grades[horse] = rank
 
-    # フォールバック（S:馬名 形式）
+    # フォールバック（例: "D:ナツハヤテ" みたいな形式）
     if not grades:
         for line in text.split("\n"):
             m = re.search(r"([SABCDEFG])\s*[:：]?\s*([^\s　|]+)", line)
             if m:
                 g = m.group(1)
-                n = re.sub(r"[（\(].*?[）\)]", "", m.group(2)).strip()
+                n = _norm_horse_name(m.group(2))
                 if n:
                     grades[n] = g
 
     return grades
+
 
 
 # ==================================================
@@ -809,13 +850,16 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
 
                 name = u.get_text(strip=True)
 
-                # grade を付与（完全一致→部分一致）
-                grade = grades.get(name, "")
-                if not grade:
-                    for k, v in grades.items():
-                        if k in name or name in k:
-                            grade = v
-                            break
+	    # grade を付与（正規化完全一致 → 正規化部分一致）
+	    name_norm = _norm_horse_name(name)
+                grade = grades.get(name_norm, "")
+
+            　　　　 if not grade:
+            　　　　    for k_norm, v in grades.items():
+               　　　　     if k_norm and (k_norm in name_norm or name_norm in k_norm):
+                　　　　        grade = v
+               　　　　         break
+
 
                 cells = tr.find_all(["td", "th"])
                 idx_st = -1
