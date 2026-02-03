@@ -848,17 +848,19 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
                 if not u:
                     continue
 
-                name = u.get_text(strip=True)
+				name = u.get_text(strip=True)
 
-	    # grade を付与（正規化完全一致 → 正規化部分一致）
-	    name_norm = _norm_horse_name(name)
-                grade = grades.get(name_norm, "")
+				# grade を付与（正規化完全一致 → 正規化部分一致）
+				name_norm = _norm_horse_name(name)
+				grade = grades.get(name_norm, "")
 
-            　　　　 if not grade:
-            　　　　    for k_norm, v in grades.items():
-               　　　　     if k_norm and (k_norm in name_norm or name_norm in k_norm):
-                　　　　        grade = v
-               　　　　         break
+				if not grade:
+  				  for k_norm, v in grades.items():
+   				     if k_norm and (k_norm in name_norm or name_norm in k_norm):
+    				        grade = v
+    				        break
+
+
 
 
                 cells = tr.find_all(["td", "th"])
