@@ -1279,13 +1279,60 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
         t = re.sub(r'([SABCDEFG])([①-⑳]*)', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}{m.group(2)}</span>', t)
         return t
 
+    def linkify_urls(text):
+        """URLをクリッカブルリンクに変換"""
+        return re.sub(
+            r'(https?://[^\s<>"]+)',
+            r'<a href="\1" target="_blank" rel="noopener" style="color:#2196F3;text-decoration:underline;">\1</a>',
+            text
+        )
+
     def format_detailed_text(text):
-        # Ai詳細や馬別詳細の中の【結論】や【調教】を強調し、調教を小さくする
+        # AI詳細の中の馬ヘッダー行を目立たせ、調教だけ小さくする
         t = html.escape(text)
-        t = re.sub(r'([SABCDEFG])(?![\w<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', t)
-        t = t.replace('【調教】', '<br><span class="chokyo-label">【調教】</span><div class="chokyo-text">')
-        t = t.replace('\n----------------------------------------\n', '</div><hr>')
-        return t
+        lines = t.split('\n')
+        result = []
+        in_chokyo = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # 馬ヘッダー行の検出 (①〜⑳ or [数字] のパターン)
+            is_horse_header = bool(re.match(r'^[\u2460-\u2473]', stripped)) or bool(re.match(r'^\d{1,2}[\)\uff09]', stripped))
+            
+            if is_horse_header:
+                # 調教ブロックを閉じる
+                if in_chokyo:
+                    result.append('</div>')
+                    in_chokyo = False
+                # ランク色付け
+                line_colored = re.sub(r'([SABCDEFG])(?![\w&<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', line)
+                result.append(f'<div class="horse-header">{line_colored}</div>')
+            elif '【調教】' in stripped:
+                if in_chokyo:
+                    result.append('</div>')
+                result.append('<span class="chokyo-label">【調教】</span><div class="chokyo-text">')
+                rest = stripped.replace('【調教】', '').strip()
+                if rest:
+                    result.append(rest)
+                in_chokyo = True
+            elif stripped.startswith('-' * 10):
+                if in_chokyo:
+                    result.append('</div>')
+                    in_chokyo = False
+                result.append('<hr>')
+            else:
+                # 通常行：ランク色付け
+                line_colored = re.sub(r'([SABCDEFG])(?![\w&<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', line)
+                if in_chokyo:
+                    result.append(line_colored)
+                else:
+                    result.append(line_colored)
+        
+        if in_chokyo:
+            result.append('</div>')
+        
+        return '\n'.join(result)
 
     html_content = f'''<!DOCTYPE html>
 <html lang="ja">
@@ -1410,8 +1457,20 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
             padding: 6px; 
             border-radius: 4px;
             margin-top: 3px;
+            margin-bottom: 8px;
+        }}
+        /* 馬ヘッダー行 */
+        .horse-header {{
+            font-size: 1.05em;
+            font-weight: bold;
+            color: #1a1a2e;
+            border-left: 4px solid var(--primary);
+            padding-left: 8px;
+            margin-top: 15px;
+            margin-bottom: 5px;
         }}
         hr {{ border: 0; border-top: 1px dashed var(--border); margin: 15px 0; }}
+        a {{ color: #2196F3; }}
         
     </style>
 </head>
@@ -1441,8 +1500,7 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
 
     <div id="tab-ai" class="tab-content">
         <div class="content-box">
-            <pre>{format_detailed_text(ai_out_clean)}</pre>
-            <!-- 最後閉じタグ補完用 -->
+            <div style="white-space:pre-wrap;font-family:inherit;margin:0;font-size:0.95em;line-height:1.5;">{format_detailed_text(ai_out_clean)}</div>
             </div>
         </div>
     </div>
@@ -1455,7 +1513,7 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
 
     <div id="tab-match" class="tab-content">
         <div class="content-box">
-            <pre>{format_rank_text(match_txt.strip())}</pre>
+            <pre>{linkify_urls(format_rank_text(match_txt.strip()))}</pre>
         </div>
     </div>
 
