@@ -1623,36 +1623,55 @@ def generate_combined_html(year, month, day, place_name, race_results):
         text_val = data.get("text", "") if isinstance(data, dict) else str(data)
         html_val = data.get("html", "") if isinstance(data, dict) else ""
         
-        # HTMLがある場合はそこからデータを抽出するのではなく、textから各セクションを分割
-        sections = text_val.split('\n\n')
-        
-        # ヘッダー、展開予想、その他を分離
+        # マーカーベースでセクション分割（\n\n分割だとAI詳細が途切れる）
         header_part = ""
         pace_part = ""
         eval_part = ""
         match_part = ""
         ai_part = ""
-        rest_parts = []
         
-        current_section = None
-        for sec in sections:
-            sec_s = sec.strip()
-            if sec_s.startswith('📅'):
-                header_part = sec_s
-            elif sec_s.startswith('【展開予想】'):
-                pace_part = sec_s
-            elif sec_s.startswith('【評価一覧】'):
-                eval_part = sec_s
-            elif sec_s.startswith('【対戦表'):
-                match_part = sec_s
-            elif sec_s.startswith('【AI評価詳細】'):
-                ai_part = sec_s.replace('【AI評価詳細】', '').strip()
-            elif sec_s:
-                # レース名ヘッダー等
-                if not header_part:
-                    header_part = sec_s
-                else:
-                    rest_parts.append(sec_s)
+        # 各セクションの開始位置を検出
+        markers = [
+            ('【展開予想】', 'pace'),
+            ('【評価一覧】', 'eval'),
+            ('【対戦表', 'match'),
+            ('【AI評価詳細】', 'ai'),
+        ]
+        
+        # テキスト先頭部分（📅行とレース名）をヘッダーとして取得
+        lines_all = text_val.split('\n')
+        header_lines = []
+        for ln in lines_all:
+            if ln.strip().startswith('【') or ln.strip().startswith('◆'):
+                break
+            if ln.strip():
+                header_lines.append(ln.strip())
+        header_part = '\n'.join(header_lines)
+        
+        # 各マーカーの位置を見つけてセクションを切り出す
+        positions = []
+        for marker_text, marker_key in markers:
+            idx = text_val.find(marker_text)
+            if idx >= 0:
+                positions.append((idx, marker_key, marker_text))
+        positions.sort(key=lambda x: x[0])
+        
+        for pi, (pos, key, marker_text) in enumerate(positions):
+            # 次のマーカーまでの範囲を切り出す
+            if pi + 1 < len(positions):
+                end_pos = positions[pi + 1][0]
+            else:
+                end_pos = len(text_val)
+            content = text_val[pos:end_pos].strip()
+            
+            if key == 'pace':
+                pace_part = content
+            elif key == 'eval':
+                eval_part = content
+            elif key == 'match':
+                match_part = content
+            elif key == 'ai':
+                ai_part = content.replace('【AI評価詳細】', '').strip()
         
         race_contents_html += f'''
         <div id="race-{r_num}" class="race-content {active}">
