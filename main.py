@@ -89,22 +89,34 @@ def main():
             # 全結果まとめ
             full_text = []
             full_text.append(f"【{target_date.strftime('%Y/%m/%d')} {selected_place} データまとめ】\n")
-            for r_num, content in sorted(st.session_state.results_cache.items()):
-                full_text.append(f"\n{'='*35}\n {selected_place} {r_num}R\n{'='*35}\n{content}\n")
+            for r_num, content_dict in sorted(st.session_state.results_cache.items()):
+                text_val = content_dict.get("text", "") if isinstance(content_dict, dict) else content_dict
+                full_text.append(f"\n{'='*35}\n {selected_place} {r_num}R\n{'='*35}\n{text_val}\n")
             
             with st.expander("📚 全レース結果をまとめてコピーする", expanded=True):
                 st.text_area("全レース結果", value="\n".join(full_text), height=300, key="res_all_summary")
             
             st.divider()
 
-            for r_num, text in sorted(st.session_state.results_cache.items()):
+            for r_num, content_dict in sorted(st.session_state.results_cache.items()):
                 st.subheader(f"{selected_place} {r_num}R")
+                text_val = content_dict.get("text", "") if isinstance(content_dict, dict) else content_dict
+                html_val = content_dict.get("html", "") if isinstance(content_dict, dict) else ""
+                
                 st.text_area(
                     label=f"{r_num}R 結果",
-                    value=text,
+                    value=text_val,
                     height=500,
                     key=f"res_cache_{r_num}"
                 )
+                if html_val:
+                    st.download_button(
+                        label=f"📥 {r_num}R HTMLをダウンロード",
+                        data=html_val,
+                        file_name=f"{target_date.strftime('%Y%m%d')}_{selected_place}{r_num}R.html",
+                        mime="text/html",
+                        key=f"dl_cache_{r_num}"
+                    )
                 st.divider()
 
     # 2. 新規実行
@@ -139,9 +151,13 @@ def main():
                     
                 elif e_type == "result":
                     race_num = event.get("race_num")
-                    output_text = e_data
+                    output_text = event.get("data_text", event.get("data", ""))
+                    output_html = event.get("data_html", "")
                     
-                    st.session_state.results_cache[race_num] = output_text
+                    st.session_state.results_cache[race_num] = {
+                        "text": output_text,
+                        "html": output_html
+                    }
                     
                     with result_container:
                         st.subheader(f"{selected_place} {race_num}R")
@@ -151,6 +167,14 @@ def main():
                             height=500,
                             key=f"res_live_{race_num}"
                         )
+                        if output_html:
+                            st.download_button(
+                                label=f"📥 {race_num}R HTMLをダウンロード",
+                                data=output_html,
+                                file_name=f"{year}{month}{day}_{selected_place}{race_num}R.html",
+                                mime="text/html",
+                                key=f"dl_live_{race_num}"
+                            )
                         st.divider()
                     
                     status_area.success(f"✅ {race_num}R 完了")

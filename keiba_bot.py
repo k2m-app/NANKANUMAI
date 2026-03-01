@@ -2,6 +2,7 @@
 import time
 import re
 import os
+import html
 import json
 import requests
 import streamlit as st
@@ -748,40 +749,33 @@ def _parse_grades_from_ai(ai_out: str):
         if not line:
             continue
 
-        # パイプ区切りっぽくない行はスキップ
-        if "|" not in line:
-            continue
+        # 既存のパイプ切り等の処理
+        if "|" in line:
+            tmp = line.replace("|", "").strip()
+            if not tmp or set(tmp) <= set("-: "):
+                continue
+            core = line[1:] if line.startswith("|") else line
+            core = core[:-1] if core.endswith("|") else core
+            cols = [c.strip() for c in core.split("|")]
+            if len(cols) >= 4:
+                rank = cols[-1].strip()
+                if re.fullmatch(r"[SABCDEFG]", rank):
+                    horse = re.split(r"\s*騎[:：]", cols[1], maxsplit=1)[0].strip()
+                    horse = _norm_horse_name(horse)
+                    if horse:
+                        grades[horse] = rank
+                        continue
 
-        # 罫線行（---|--- 等）っぽいのは除外
-        tmp = line.replace("|", "").strip()
-        if tmp and set(tmp) <= set("-: "):
-            continue
-
-        # 先頭/末尾に | があってもなくてもOKにする
-        core = line
-        if core.startswith("|"):
-            core = core[1:]
-        if core.endswith("|"):
-            core = core[:-1]
-
-        cols = [c.strip() for c in core.split("|")]
-
-        # 最低4列（馬番 / 馬名・騎手 / スコア / ランク）想定
-        if len(cols) < 4:
-            continue
-
-        rank = cols[-1].strip()
-        if not re.fullmatch(r"[SABCDEFG]", rank):
-            continue
-
-        name_cell = cols[1]
-
-        # 「馬名 騎:～～」形式を想定して馬名だけ抜く（騎: 以前を馬名とみなす）
-        horse = re.split(r"\s*騎[:：]", name_cell, maxsplit=1)[0].strip()
-        horse = _norm_horse_name(horse)
-        if horse:
-            grades[horse] = rank
-
+        # 新フォーマット対応: "①アルマリアルト　D" または "[1]アルマリアルト D"
+        # マーク（丸文字やカッコ数字）や「馬名」＋空白＋「アルファベット1文字」を探す
+        m = re.search(r"(?:[①-⑳]|\[\d+\])?\s*([^\s　]+)[\s　]+([SABCDEFG])\s*$", line)
+        if m:
+            horse = _norm_horse_name(m.group(1))
+            rank = m.group(2)
+            if horse:
+                grades[horse] = rank
+                continue
+                
     # フォールバック（例: "D:ナツハヤテ" みたいな形式）
     if not grades:
         for line in text.split("\n"):
@@ -919,6 +913,340 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
         return f"(対戦表取得エラー: {e})"
 
 
+def predict_pace_python(horses_data, danwa_data, current_distance_str):
+    predictions = []
+    
+    # 距離の抽出
+    dm = re.search(r'(\d{1,3}(?:,\d{3})*|\d+)(?=m)', str(current_distance_str).replace(',', ''))
+    curr_dist = int(dm.group(1)) if dm else 1400
+
+    for umaban, data in horses_data.items():
+        name = data.get("name", "")
+        hist = data.get("hist", [])
+        danwa = danwa_data.get(umaban, "")
+        
+        base_aggro_score = 0
+        if hist:
+            latest_hist = hist[0]
+            pos_match = re.search(r'(\d+-\d+(?:-\d+)*)', latest_hist)
+            if pos_match:
+                positions = [int(p) for p in pos_match.group(1).split('-') if p.isdigit()]
+                if positions:
+                    calc_pos = positions[0] 
+                    base_aggro_score = max(0, 11 - calc_pos) * 2 
+            
+            dist_match = re.search(r'(\d{3,4})m?', latest_hist)
+            if dist_match:
+                prev_dist = int(dist_match.group(1))
+                if prev_dist < curr_dist:
+                    base_aggro_score += 5  
+                elif prev_dist > curr_dist:
+                    base_aggro_score -= 3  
+
+        comment_mod = 0
+        if danwa:
+            if re.search(r'(前走|前回).*(逃げ|前).*(苦し|厳し|バテ|甘く)', danwa):
+                comment_mod -= 5
+            if re.search(r'(ハナ.*こだわらない|控える|溜める|番手.(いい|競馬)|中団)', danwa):
+                comment_mod -= 10
+            if re.search(r'(ハナ.(切|行|主張|立)|前.(行け|つけ|行きた))', danwa):
+                comment_mod += 15
+
+        waku_mod = max(0, 5 - int(umaban) if str(umaban).isdigit() else 0)
+        final_score = base_aggro_score + comment_mod + waku_mod
+        
+        predictions.append({
+            "umaban": umaban,
+            "name": name,
+            "score": final_score,
+            "danwa_reason": comment_mod
+        })
+
+    predictions.sort(key=lambda x: x["score"], reverse=True)
+    
+    escape_horses = [p for p in predictions if p["score"] >= 15]
+    
+    if len(escape_horses) >= 3:
+        pace = "ハイペース"
+        explanation = "逃げ・先行意欲の高い馬が複数おり、序盤から激しいポジション争いが予想されるため、差し馬の台頭に注意。"
+    elif len(escape_horses) == 0:
+        pace = "スローペース"
+        explanation = "明確にハナを主張する馬がおらず、押し出されるように隊列が落ち着く可能性が高い。前残りの展開に注意。"
+    else:
+        pace = "ミドルペース"
+        explanation = "ハナ候補がすんなり隊列を先導し、淀みのない平均的なペースで流れると予想される。"
+
+    leaders = " ".join([f"[{h['umaban']}]{h['name']}" for h in predictions[:2]])
+    
+    tenkai_text = f"【展開予想】\n"
+    tenkai_text += f"◆ペース予想：{pace}\n"
+    tenkai_text += f"◆ハナ・先行候補：{leaders}\n"
+    tenkai_text += f"◆展開解説：{explanation}\n"
+    tenkai_text += "◆想定隊列順: " + " → ".join([f"[{p['umaban']}]{p['name']}" for p in predictions])
+    
+    return tenkai_text
+
+def build_evaluation_list(grades, horses_data):
+    rank_map = {"S": [], "A": [], "B": [], "C": [], "D": [], "E": [], "F": [], "G": [], "無": []}
+    
+    for u, hd in horses_data.items():
+        name_norm = _norm_horse_name(hd["name"])
+        grade = grades.get(name_norm, "")
+        if not grade:
+            for k_norm, v in grades.items():
+                if k_norm and (k_norm in name_norm or name_norm in k_norm):
+                    grade = v
+                    break
+        if not grade:
+            grade = "無"
+            
+        if grade in rank_map:
+            rank_map[grade].append(u)
+        else:
+            rank_map[grade] = [u]
+            
+    eval_text = "【評価一覧】"
+    parts = []
+    for r in ["S", "A", "B", "C", "D", "E", "F", "G", "無"]:
+        if rank_map.get(r):
+            nums = "".join([f"[{x}]" for x in rank_map[r]])
+            if r == "無":
+                parts.append(f"評価なし{nums}")
+            else:
+                parts.append(f"{r}{nums}")
+    
+    if parts:
+        eval_text += "  " + "  ".join(parts)
+    else:
+        eval_text += "  (評価データなし)"
+    return eval_text
+
+def generate_html_output(year, month, day, place_name, r_num, header1, pace_text, eval_list_text, match_txt, ai_out_clean, details_text):
+    
+    # ランク別に色付けするためのHTML整形関数（スマホ向けコンパクト化＋色付け）
+    def format_rank_text(text):
+        t = html.escape(text)
+        t = re.sub(r'([SABCDEFG])([①-⑳]*)', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}{m.group(2)}</span>', t)
+        return t
+
+    def format_detailed_text(text):
+        # Ai詳細や馬別詳細の中の【結論】や【調教】を強調し、調教を小さくする
+        t = html.escape(text)
+        t = re.sub(r'([SABCDEFG])(?![\w<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', t)
+        t = t.replace('【調教】', '<br><span class="chokyo-label">【調教】</span><div class="chokyo-text">')
+        t = t.replace('\n----------------------------------------\n', '</div><hr>')
+        return t
+
+    html_content = f'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>{year}/{month}/{day} {place_name}{r_num}R 予想</title>
+    <style>
+        :root {{
+            --primary: #2c3e50;
+            --bg: #f5f7fa;
+            --box-bg: #ffffff;
+            --text: #333333;
+            --border: #e2e8f0;
+            --s-color: #d4af37; /* 金色 */
+            --a-color: #ff69b4; /* ピンク */
+            --b-color: #ff4500; /* 赤色 */
+            --c-color: #ff8c00; /* オレンジ */
+            --d-color: #ffd700; /* 黄色 */
+            --e-color: #32cd32; /* 緑 */
+            --f-color: #999999;
+            --g-color: #cccccc;
+        }}
+        body {{
+            font-family: "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 0;
+            font-size: 14px;
+            line-height: 1.5;
+        }}
+        .header {{ 
+            background-color: var(--primary); 
+            color: white; 
+            padding: 12px 15px; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }}
+        .header h2 {{ margin: 0; font-size: 1.1em; }}
+        .header p {{ margin: 5px 0 0 0; font-size: 0.85em; opacity: 0.9; }}
+        
+        /* ランクの色 */
+        .rank-S {{ color: var(--s-color); font-weight: bold; font-size: 1.2em; text-shadow: 0 0 1px rgba(0,0,0,0.3); }}
+        .rank-A {{ color: var(--a-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-B {{ color: var(--b-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-C {{ color: var(--c-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-D {{ color: var(--d-color); font-weight: bold; font-size: 1.0em; text-shadow: 0 0 1px rgba(0,0,0,0.3); }}
+        .rank-E {{ color: var(--e-color); font-weight: bold; font-size: 1.0em; }}
+        .rank-F {{ color: var(--f-color); font-weight: bold; font-size: 1.0em; }}
+        .rank-G {{ color: var(--g-color); font-weight: bold; font-size: 1.0em; }}
+        
+        .eval-list-container {{
+            background: var(--box-bg);
+            margin: 10px;
+            padding: 12px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .eval-title {{ font-weight: bold; border-bottom: 2px solid var(--primary); padding-bottom: 3px; margin-bottom: 8px; font-size: 1.1em;}}
+        .eval-list {{ font-size: 1.1em; line-height: 1.6; word-break: break-all; }}
+
+        /* タブシステム */
+        .tabs {{
+            display: flex;
+            background: #fff;
+            border-bottom: 1px solid var(--border);
+            overflow-x: auto;
+            position: sticky;
+            top: 54px;
+            z-index: 90;
+        }}
+        .tab-button {{
+            flex: 1;
+            min-width: 80px;
+            background: none;
+            border: none;
+            padding: 12px 5px;
+            font-size: 0.95em;
+            font-weight: bold;
+            color: #666;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            white-space: nowrap;
+        }}
+        .tab-button.active {{
+            color: var(--primary);
+            border-bottom: 3px solid var(--primary);
+        }}
+        .tab-content {{
+            display: none;
+            padding: 10px;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        
+        .content-box {{
+            background: var(--box-bg);
+            padding: 12px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 15px;
+            overflow-x: auto;
+        }}
+        
+        pre {{ 
+            white-space: pre-wrap; 
+            font-family: inherit; 
+            margin: 0;
+            font-size: 0.95em;
+        }}
+        
+        /* 調教テキスト小さく */
+        .chokyo-label {{ font-size: 0.85em; font-weight: bold; color: #555; }}
+        .chokyo-text {{ 
+            font-size: 0.8em; 
+            color: #666; 
+            background: #f8f9fa; 
+            padding: 6px; 
+            border-radius: 4px;
+            margin-top: 3px;
+        }}
+        hr {{ border: 0; border-top: 1px dashed var(--border); margin: 15px 0; }}
+        
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>{year}/{month}/{day} {place_name}{r_num}R</h2>
+        <p>{html.escape(header1)}</p>
+    </div>
+    
+    <div class="eval-list-container">
+        <div class="eval-title">📊 評価一覧</div>
+        <div class="eval-list">{format_rank_text(eval_list_text)}</div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-button active" onclick="openTab(event, 'tab-pace')">展開予想</button>
+        <button class="tab-button" onclick="openTab(event, 'tab-ai')">AI詳細</button>
+        <button class="tab-button" onclick="openTab(event, 'tab-detail')">馬別詳細</button>
+        <button class="tab-button" onclick="openTab(event, 'tab-match')">対戦表</button>
+    </div>
+
+    <div id="tab-pace" class="tab-content active">
+        <div class="content-box">
+            <pre>{html.escape(pace_text)}</pre>
+        </div>
+    </div>
+
+    <div id="tab-ai" class="tab-content">
+        <div class="content-box">
+            <pre>{format_detailed_text(ai_out_clean)}</pre>
+            <!-- 最後閉じタグ補完用 -->
+            </div>
+        </div>
+    </div>
+
+    <div id="tab-detail" class="tab-content">
+        <div class="content-box">
+            <pre>{html.escape(details_text).replace('【近走】', '<hr>【近走】')}</pre>
+        </div>
+    </div>
+
+    <div id="tab-match" class="tab-content">
+        <div class="content-box">
+            <pre>{format_rank_text(match_txt.strip())}</pre>
+        </div>
+    </div>
+
+    <script>
+        function openTab(evt, tabName) {{
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tab-content");
+            for (i = 0; i < tabcontent.length; i++) {{
+                tabcontent[i].style.display = "none";
+                tabcontent[i].classList.remove("active");
+            }}
+            tablinks = document.getElementsByClassName("tab-button");
+            for (i = 0; i < tablinks.length; i++) {{
+                tablinks[i].classList.remove("active");
+            }}
+            var targetTab = document.getElementById(tabName);
+            if (targetTab) {{
+                targetTab.style.display = "block";
+                targetTab.classList.add("active");
+            }}
+            evt.currentTarget.classList.add("active");
+            
+            // 状態をlocalStorageに保存（レース番号ごとに記録）
+            localStorage.setItem('keiba_active_tab_{r_num}', tabName);
+        }}
+        
+        // ページ読み込み時に前回のタブを復元
+        document.addEventListener('DOMContentLoaded', (event) => {{
+            const savedTab = localStorage.getItem('keiba_active_tab_{r_num}');
+            if (savedTab) {{
+                const tabButton = document.querySelector(`button[onclick*="'${{savedTab}}'"]`);
+                if (tabButton) {{
+                    tabButton.click();
+                }}
+            }}
+        }});
+    </script>
+</body>
+</html>'''
+    return html_content
+
 # ==================================================
 # 10. ジェネレータ（全レース処理）
 # ==================================================
@@ -1034,13 +1362,21 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 if mode == "raw":
                     yield {"type": "status", "data": f"🔍 {r_num}R 対戦データを取得中..."}
                     match_txt = _fetch_matchup_table_selenium(driver, nk_id, grades={})
+                    
+                    header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
+                    pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
+                    details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
 
                     final_text = (
                         f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
-                        f"=== 🔍RAW入力 ===\n{full_prompt}\n\n"
-                        f"{match_txt}"
+                        f"{header1}\n\n"
+                        f"{pace_text}\n\n"
+                        f"{match_txt}\n\n"
+                        f"{details_text}"
                     )
-                    yield {"type": "result", "race_num": r_num, "data": final_text}
+                    final_html = generate_html_output(year, month, day, place_name, r_num, header1, pace_text, "【評価一覧】  (AI未実行)", match_txt, "(AI未実行)", details_text)
+
+                    yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
                     time.sleep(1)
                     continue
 
@@ -1067,13 +1403,25 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
                 ai_out_clean = inject_cyokyo_before_rank(ai_out_clean, cyokyo)
 
 
+                # ユーザー指定のフォーマットに組み立て
+                header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
+                pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
+                eval_list_text = build_evaluation_list(grades, nk_data["horses"])
+                details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
+
                 final_text = (
                     f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
-                    f"=== 🤖AI予想 ===\n{ai_out_clean}\n\n"
-                    f"{match_txt}"
+                    f"{header1}\n\n"
+                    f"{pace_text}\n\n"
+                    f"{eval_list_text}\n\n"
+                    f"{match_txt}\n\n"
+                    f"【AI評価詳細】\n{ai_out_clean}\n\n"
+                    f"{details_text}"
                 )
+                
+                final_html = generate_html_output(year, month, day, place_name, r_num, header1, pace_text, eval_list_text, match_txt, ai_out_clean, details_text)
 
-                yield {"type": "result", "race_num": r_num, "data": final_text}
+                yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
                 time.sleep(15)
 
 
