@@ -1430,13 +1430,26 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
 
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
+                # ページ読み込み完了を待つ（基本テーブルは常にサーバーサイドレンダリング済み）
                 try:
-                    driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "shosai_aria")))
-                    time.sleep(1.0)
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "table.nk23_c-table22__table, table.nk23_c-table23__table, #shosai_aria"))
+                    )
                 except TimeoutException:
-                    yield {"type": "error", "data": f"{r_num}R 詳細データ読み込みタイムアウト"}
+                    yield {"type": "error", "data": f"{r_num}R ページ読み込みタイムアウト"}
                     continue
+                
+                # ページのJS初期化を待つ
+                time.sleep(1.5)
+                
+                # 詳細タブ切り替え（失敗しても続行：データはHTML内に存在する）
+                for attempt in range(3):
+                    try:
+                        driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
+                        time.sleep(1.0)
+                        break
+                    except Exception:
+                        time.sleep(1.0)
 
                 nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
 
