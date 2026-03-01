@@ -1250,7 +1250,7 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
 # ==================================================
 # 10. ジェネレータ（全レース処理）
 # ==================================================
-def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kwargs):
+def run_races_iter(year, month, day, place_code, target_races, mode="dify", manual_kai_nichi=None, **kwargs):
     resources = load_resources()
 
     kb_input_map = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
@@ -1262,10 +1262,17 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", **kw
     driver = get_driver()
 
     try:
-        yield {"type": "status", "data": f"📅 開催特定中 ({place_name})..."}
-        kai, nichi = get_nankan_kai_nichi(month, day, place_name)
+        kai, nichi = None, None
+        if manual_kai_nichi and manual_kai_nichi.get("kai") and manual_kai_nichi.get("nichi"):
+            kai = manual_kai_nichi["kai"]
+            nichi = manual_kai_nichi["nichi"]
+            yield {"type": "status", "data": f"📅 手動指定を使用: {place_name} 第{kai}回 {nichi}日目"}
+        else:
+            yield {"type": "status", "data": f"📅 開催特定中 ({place_name})..."}
+            kai, nichi = get_nankan_kai_nichi(month, day, place_name)
+            
         if not kai:
-            yield {"type": "error", "data": "開催特定失敗"}
+            yield {"type": "error", "data": "開催特定失敗（左のメニューから手動で第何回・何日目か入力してください）"}
             return
 
         yield {"type": "status", "data": f"✅ {place_name} 第{kai}回 {nichi}日目"}

@@ -4,6 +4,7 @@ import streamlit as st
 st.set_page_config(page_title="南関競馬AI予想くん", layout="wide")
 
 import datetime
+from datetime import timezone, timedelta
 import time
 import traceback
 
@@ -23,13 +24,22 @@ def main():
     # --- サイドバー設定 ---
     with st.sidebar:
         st.header("開催設定")
-        today = datetime.date.today()
+        # 日本時間をデフォルトにする
+        JST = timezone(timedelta(hours=+9), 'JST')
+        today = datetime.datetime.now(JST).date()
         target_date = st.date_input("開催日", today)
         
         place_options = {"大井": "10", "川崎": "11", "船橋": "12", "浦和": "13"}
         selected_place = st.selectbox("競馬場", list(place_options.keys()))
         place_code = place_options[selected_place]
         
+        st.divider()
+        st.subheader("開催手動入力 (自動取得失敗時)")
+        st.caption("※通常は自動判定しますが、エラー時はチェックを入れて手動入力してください。")
+        use_manual_kai = st.checkbox("開催回数を手動で指定する")
+        manual_kai = st.number_input("第○回", min_value=1, max_value=20, value=1, step=1, disabled=not use_manual_kai)
+        manual_nichi = st.number_input("○日目", min_value=1, max_value=6, value=1, step=1, disabled=not use_manual_kai)
+
         st.divider()
         st.subheader("モード選択")
         exec_mode = st.radio(
@@ -136,9 +146,12 @@ def main():
         mode_text = "AI予想" if exec_mode == "dify" else "データ取得"
         status_area.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 ({len(selected_races_final)}レース) の【{mode_text}】を開始します...")
 
+        # 手動入力のパラメータ
+        manual_param = {"kai": manual_kai, "nichi": manual_nichi} if use_manual_kai else None
+
         try:
             # ジェネレータ実行
-            for event in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), mode=exec_mode):
+            for event in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), mode=exec_mode, manual_kai_nichi=manual_param):
                 
                 e_type = event.get("type")
                 e_data = event.get("data")
