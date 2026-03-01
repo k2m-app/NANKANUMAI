@@ -811,6 +811,8 @@ def fetch_past_race_2f_times(url, driver=None):
     """
     sess = get_http_session()
     try:
+        import time
+        time.sleep(0.5) # サーバー負荷・IP制限回避のためのウェイト
         res = sess.get(url, timeout=5)
         res.encoding = "cp932"
         # ラップタイムの抽出 (例: 6.1-12.0-14.3-...)
@@ -1021,6 +1023,7 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
     # 南関4競馬場のテン速度を計算
     nankan_places = ["浦和", "船橋", "大井", "川崎"]
     speeds_log = []
+    url_cache = {}
     
     for p in top_5:
         p["speed_avg"] = None
@@ -1031,7 +1034,13 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
             if h.get("place") not in nankan_places:
                 continue
                 
-            raw_speed = fetch_past_race_2f_times(h["url"])
+            past_url = h["url"]
+            if past_url in url_cache:
+                raw_speed = url_cache[past_url]
+            else:
+                raw_speed = fetch_past_race_2f_times(past_url)
+                url_cache[past_url] = raw_speed
+                
             if raw_speed:
                 # 通過順位によるペナルティ(1番手以外は減速)
                 pas_str = h.get("pas", "")
@@ -1423,7 +1432,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
                 try:
                     driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "shosai_aria")))
+                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "shosai_aria")))
                     time.sleep(1.0)
                 except TimeoutException:
                     yield {"type": "error", "data": f"{r_num}R 詳細データ読み込みタイムアウト"}
