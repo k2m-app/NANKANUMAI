@@ -1429,39 +1429,34 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
 
                 danwa, cyokyo = parse_kb_danwa_cyokyo(driver, kb_id)
 
-                driver.get(f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do")
-                # ページ読み込み完了を待つ（基本テーブルは常にサーバーサイドレンダリング済み）
+                # 南関競馬の詳細ページをHTTPで直接取得（サーバーサイドレンダリング済みのためSelenium不要）
+                detail_url = f"https://www.nankankeiba.com/uma_shosai/{nk_id}.do"
+                sess = get_http_session()
                 try:
-                    WebDriverWait(driver, 20).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "table.nk23_c-table22__table, table.nk23_c-table23__table, #shosai_aria"))
-                    )
-                except TimeoutException:
-                    yield {"type": "error", "data": f"{r_num}R ページ読み込みタイムアウト"}
+                    detail_res = sess.get(detail_url, timeout=15)
+                    detail_res.encoding = "cp932"
+                    detail_html = detail_res.text
+                except Exception as e:
+                    yield {"type": "error", "data": f"{r_num}R 詳細ページ取得失敗: {e}"}
                     continue
-                
-                # ページのJS初期化を待つ
-                time.sleep(1.5)
-                
-                # 詳細タブ切り替え（失敗しても続行：データはHTML内に存在する）
-                for attempt in range(3):
-                    try:
-                        driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                        time.sleep(1.0)
-                        break
-                    except Exception:
-                        time.sleep(1.0)
 
-                nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
+                nk_data = parse_nankankeiba_detail(detail_html, place_name, resources)
 
-                # リトライ（詳細が空だったとき）
                 if not nk_data["horses"]:
-                    for _ in range(2):
-                        time.sleep(1)
-                        driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
-                        time.sleep(1)
+                    # フォールバック: Seleniumで再試行
+                    try:
+                        driver.get(detail_url)
+                        time.sleep(2)
+                        for attempt in range(3):
+                            try:
+                                driver.execute_script("if(typeof changeShosai === 'function'){ changeShosai('s1'); }")
+                                time.sleep(1.5)
+                                break
+                            except Exception:
+                                time.sleep(1)
                         nk_data = parse_nankankeiba_detail(driver.page_source, place_name, resources)
-                        if nk_data["horses"]:
-                            break
+                    except Exception:
+                        pass
 
                 if not nk_data["horses"]:
                     yield {"type": "error", "data": f"{r_num}R データなし (HTML解析失敗)"}
