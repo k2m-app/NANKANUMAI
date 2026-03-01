@@ -7,6 +7,7 @@ import datetime
 from datetime import timezone, timedelta
 import time
 import traceback
+import re
 
 # 外部ファイル読み込み（エラーハンドリング付き）
 try:
@@ -80,12 +81,15 @@ def main():
 
         if "results_cache" not in st.session_state:
             st.session_state.results_cache = {}
+        if "failed_races" not in st.session_state:
+            st.session_state.failed_races = set()
 
         st.caption("※AI予想は最大10分/レース程度かかる場合があります")
         start_btn = st.button("実行開始", type="primary", key="btn_start")
         
         if st.button("結果クリア"):
             st.session_state.results_cache = {}
+            st.session_state.failed_races = set()
             st.rerun()
 
     # --- メイン処理エリア ---
@@ -143,14 +147,28 @@ def main():
                     )
                 st.divider()
 
-    # 2. 新規実行
-    if start_btn:
-        if not selected_races_final:
-            st.warning("レースを選択してください。")
-            st.stop()
+    # 2. リトライボタン（失敗レースがある場合）
+    retry_btn = False
+    if st.session_state.failed_races and not start_btn:
+        with result_container:
+            failed_list = sorted(st.session_state.failed_races)
+            st.warning(f"⚠️ 以下のレースでエラーが発生しました: {', '.join([f'{r}R' for r in failed_list])}")
+            retry_btn = st.button(f"🔄 失敗した{len(failed_list)}レースをリトライ", type="primary", key="btn_retry")
 
-        # キャッシュクリア
-        st.session_state.results_cache = {}
+    # 3. 新規実行 or リトライ
+    if start_btn or retry_btn:
+        if start_btn:
+            if not selected_races_final:
+                st.warning("レースを選択してください。")
+                st.stop()
+            # 新規実行時のみキャッシュクリア
+            st.session_state.results_cache = {}
+            st.session_state.failed_races = set()
+            races_to_run = set(selected_races_final)
+        else:
+            # リトライ: 失敗レースのみ実行、成功分は保持
+            races_to_run = st.session_state.failed_races.copy()
+            st.session_state.failed_races = set()
         
         year = target_date.year
         month = f"{target_date.month:02}"
@@ -167,7 +185,7 @@ def main():
 
         try:
             # ジェネレータ実行
-            for event in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), mode=exec_mode, manual_kai_nichi=manual_param):
+            for event in keiba_bot.run_races_iter(year, month, day, place_code, races_to_run, mode=exec_mode, manual_kai_nichi=manual_param):
                 
                 e_type = event.get("type")
                 e_data = event.get("data")
@@ -177,6 +195,10 @@ def main():
                 
                 elif e_type == "error":
                     st.error(e_data)
+                    # レース番号を抽出してfailed_racesに追加
+                    err_match = re.search(r'(\d+)R', str(e_data))
+                    if err_match:
+                        st.session_state.failed_races.add(int(err_match.group(1)))
                     
                 elif e_type == "early_result":
                     race_num = event.get("race_num")
@@ -222,7 +244,11 @@ def main():
                     
                     status_area.success(f"✅ {race_num}R 完了")
 
-            status_area.success("✅ 全ての処理が完了しました！画面を更新してまとめを表示します...")
+            if st.session_state.failed_races:
+                failed_list = sorted(st.session_state.failed_races)
+                status_area.warning(f"⚠️ 完了（{len(failed_list)}レースでエラー: {', '.join([f'{r}R' for r in failed_list])}）画面更新後にリトライできます")
+            else:
+                status_area.success("✅ 全ての処理が完了しました！画面を更新してまとめを表示します...")
             time.sleep(2)
             st.rerun()
             
