@@ -106,6 +106,20 @@ def main():
             with st.expander("📚 全レース結果をまとめてコピーする", expanded=True):
                 st.text_area("全レース結果", value="\n".join(full_text), height=300, key="res_all_summary")
             
+            # 合算HTML（全レースをタブ切り替えで見られるHTMLファイル）
+            if len(st.session_state.results_cache) >= 1:
+                combined_html = keiba_bot.generate_combined_html(
+                    target_date.year, f"{target_date.month:02}", f"{target_date.day:02}",
+                    selected_place, st.session_state.results_cache
+                )
+                st.download_button(
+                    label=f"📥 全{len(st.session_state.results_cache)}レースまとめHTMLをダウンロード",
+                    data=combined_html,
+                    file_name=f"{target_date.strftime('%Y%m%d')}_{selected_place}_全レース.html",
+                    mime="text/html",
+                    key="dl_combined_html"
+                )
+            
             st.divider()
 
             for r_num, content_dict in sorted(st.session_state.results_cache.items()):

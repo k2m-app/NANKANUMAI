@@ -1555,6 +1555,253 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
 </html>'''
     return html_content
 
+
+def generate_combined_html(year, month, day, place_name, race_results):
+    """全レースを1つのHTMLにまとめてレースタブで切り替えられるページを生成"""
+    
+    def _escape(text):
+        return html.escape(str(text)) if text else ""
+    
+    def _rank_color(text):
+        t = html.escape(str(text))
+        t = re.sub(r'([SABCDEFG])([①-⑳]*)', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}{m.group(2)}</span>', t)
+        return t
+    
+    def _linkify(text):
+        return re.sub(
+            r'(https?://[^\s<>"]+)',
+            r'<a href="\1" target="_blank" rel="noopener" style="color:#2196F3;">\1</a>',
+            text
+        )
+
+    def _format_ai(text):
+        t = html.escape(str(text))
+        lines = t.split('\n')
+        result = []
+        in_chokyo = False
+        for line in lines:
+            stripped = line.strip()
+            is_horse_header = bool(re.match(r'^[\u2460-\u2473]', stripped)) or bool(re.match(r'^\d{1,2}[\)\uff09]', stripped))
+            if is_horse_header:
+                if in_chokyo:
+                    result.append('</div>')
+                    in_chokyo = False
+                line_c = re.sub(r'([SABCDEFG])(?![\w&<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', line)
+                result.append(f'<div class="horse-header">{line_c}</div>')
+            elif '【調教】' in stripped:
+                if in_chokyo:
+                    result.append('</div>')
+                result.append('<span class="chokyo-label">【調教】</span><div class="chokyo-text">')
+                rest = stripped.replace('【調教】', '').strip()
+                if rest:
+                    result.append(rest)
+                in_chokyo = True
+            elif stripped.startswith('-' * 10):
+                if in_chokyo:
+                    result.append('</div>')
+                    in_chokyo = False
+                result.append('<hr>')
+            else:
+                line_c = re.sub(r'([SABCDEFG])(?![\w&<>])', lambda m: f'<span class="rank-{m.group(1)}">{m.group(1)}</span>', line)
+                result.append(line_c)
+        if in_chokyo:
+            result.append('</div>')
+        return '\n'.join(result)
+
+    sorted_races = sorted(race_results.items(), key=lambda x: int(x[0]))
+    
+    # レースタブボタン
+    race_tabs_html = ""
+    for i, (r_num, _) in enumerate(sorted_races):
+        active = "active" if i == 0 else ""
+        race_tabs_html += f'<button class="race-tab {active}" onclick="openRace(event, \'race-{r_num}\')">{r_num}R</button>\n'
+    
+    # 各レースのコンテンツ
+    race_contents_html = ""
+    for i, (r_num, data) in enumerate(sorted_races):
+        active = "active" if i == 0 else ""
+        text_val = data.get("text", "") if isinstance(data, dict) else str(data)
+        html_val = data.get("html", "") if isinstance(data, dict) else ""
+        
+        # HTMLがある場合はそこからデータを抽出するのではなく、textから各セクションを分割
+        sections = text_val.split('\n\n')
+        
+        # ヘッダー、展開予想、その他を分離
+        header_part = ""
+        pace_part = ""
+        eval_part = ""
+        match_part = ""
+        ai_part = ""
+        rest_parts = []
+        
+        current_section = None
+        for sec in sections:
+            sec_s = sec.strip()
+            if sec_s.startswith('📅'):
+                header_part = sec_s
+            elif sec_s.startswith('【展開予想】'):
+                pace_part = sec_s
+            elif sec_s.startswith('【評価一覧】'):
+                eval_part = sec_s
+            elif sec_s.startswith('【対戦表'):
+                match_part = sec_s
+            elif sec_s.startswith('【AI評価詳細】'):
+                ai_part = sec_s.replace('【AI評価詳細】', '').strip()
+            elif sec_s:
+                # レース名ヘッダー等
+                if not header_part:
+                    header_part = sec_s
+                else:
+                    rest_parts.append(sec_s)
+        
+        race_contents_html += f'''
+        <div id="race-{r_num}" class="race-content {active}">
+            <div class="race-header-bar">{_escape(header_part)}</div>
+            
+            <div class="inner-tabs">
+                <button class="inner-tab active" onclick="openInnerTab(event, 'race-{r_num}-pace')">展開</button>
+                <button class="inner-tab" onclick="openInnerTab(event, 'race-{r_num}-ai')">AI詳細</button>
+                <button class="inner-tab" onclick="openInnerTab(event, 'race-{r_num}-match')">対戦表</button>
+            </div>
+            
+            <div id="race-{r_num}-pace" class="inner-content active">
+                <div class="content-box">
+                    <div class="eval-box">{_rank_color(eval_part)}</div>
+                    <pre>{_escape(pace_part)}</pre>
+                </div>
+            </div>
+            
+            <div id="race-{r_num}-ai" class="inner-content">
+                <div class="content-box">
+                    <div style="white-space:pre-wrap;font-size:0.95em;line-height:1.5;">{_format_ai(ai_part)}</div>
+                </div>
+            </div>
+            
+            <div id="race-{r_num}-match" class="inner-content">
+                <div class="content-box">
+                    <pre>{_linkify(_rank_color(match_part))}</pre>
+                </div>
+            </div>
+        </div>
+        '''
+    
+    combined_html = f'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>{year}/{month}/{day} {place_name} 全レース予想</title>
+    <style>
+        :root {{
+            --primary: #2c3e50; --bg: #f5f7fa; --box-bg: #fff; --text: #333; --border: #e2e8f0;
+            --s-color: #d4af37; --a-color: #ff69b4; --b-color: #ff4500; --c-color: #ff8c00;
+            --d-color: #ffd700; --e-color: #32cd32; --f-color: #999; --g-color: #ccc;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: "Hiragino Kaku Gothic ProN","Meiryo",sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; }}
+        
+        .main-header {{ background: var(--primary); color: #fff; padding: 12px 15px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 4px rgba(0,0,0,0.15); }}
+        .main-header h2 {{ font-size: 1.1em; }}
+        
+        /* レース番号タブ */
+        .race-tabs {{
+            display: flex; flex-wrap: wrap; gap: 2px; background: #fff; padding: 6px 8px;
+            border-bottom: 2px solid var(--border); position: sticky; top: 48px; z-index: 90;
+        }}
+        .race-tab {{
+            padding: 8px 14px; border: 1px solid var(--border); border-radius: 6px 6px 0 0;
+            background: #f0f0f0; color: #666; font-weight: bold; font-size: 0.95em; cursor: pointer;
+            border-bottom: none;
+        }}
+        .race-tab.active {{ background: var(--primary); color: #fff; border-color: var(--primary); }}
+        
+        .race-content {{ display: none; }}
+        .race-content.active {{ display: block; }}
+        
+        .race-header-bar {{ background: #e8ecf1; padding: 10px 12px; font-weight: bold; font-size: 0.95em; border-bottom: 1px solid var(--border); }}
+        
+        /* 内部タブ(展開/AI/対戦) */
+        .inner-tabs {{ display: flex; background: #fff; border-bottom: 1px solid var(--border); }}
+        .inner-tab {{
+            flex: 1; padding: 10px 5px; border: none; background: none; font-size: 0.9em;
+            font-weight: bold; color: #888; cursor: pointer; border-bottom: 3px solid transparent;
+        }}
+        .inner-tab.active {{ color: var(--primary); border-bottom: 3px solid var(--primary); }}
+        
+        .inner-content {{ display: none; padding: 10px; }}
+        .inner-content.active {{ display: block; }}
+        
+        .content-box {{ background: var(--box-bg); padding: 12px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 10px; overflow-x: auto; }}
+        .eval-box {{ font-size: 1.1em; line-height: 1.6; margin-bottom: 10px; word-break: break-all; }}
+        pre {{ white-space: pre-wrap; font-family: inherit; margin: 0; font-size: 0.95em; }}
+        
+        .rank-S {{ color: var(--s-color); font-weight: bold; font-size: 1.2em; text-shadow: 0 0 1px rgba(0,0,0,0.3); }}
+        .rank-A {{ color: var(--a-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-B {{ color: var(--b-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-C {{ color: var(--c-color); font-weight: bold; font-size: 1.1em; }}
+        .rank-D {{ color: var(--d-color); font-weight: bold; text-shadow: 0 0 1px rgba(0,0,0,0.3); }}
+        .rank-E {{ color: var(--e-color); font-weight: bold; }}
+        .rank-F {{ color: var(--f-color); font-weight: bold; }}
+        .rank-G {{ color: var(--g-color); font-weight: bold; }}
+        
+        .horse-header {{ font-size: 1.05em; font-weight: bold; color: #1a1a2e; border-left: 4px solid var(--primary); padding-left: 8px; margin: 15px 0 5px; }}
+        .chokyo-label {{ font-size: 0.85em; font-weight: bold; color: #555; }}
+        .chokyo-text {{ font-size: 0.8em; color: #666; background: #f8f9fa; padding: 6px; border-radius: 4px; margin: 3px 0 8px; }}
+        hr {{ border: 0; border-top: 1px dashed var(--border); margin: 15px 0; }}
+        a {{ color: #2196F3; }}
+    </style>
+</head>
+<body>
+    <div class="main-header">
+        <h2>📅 {year}/{month}/{day} {place_name} 全{len(sorted_races)}レース</h2>
+    </div>
+    
+    <div class="race-tabs">
+        {race_tabs_html}
+    </div>
+    
+    {race_contents_html}
+    
+    <script>
+        function openRace(evt, raceId) {{
+            document.querySelectorAll('.race-content').forEach(el => {{ el.classList.remove('active'); el.style.display = 'none'; }});
+            document.querySelectorAll('.race-tab').forEach(el => el.classList.remove('active'));
+            var target = document.getElementById(raceId);
+            if (target) {{ target.style.display = 'block'; target.classList.add('active'); }}
+            evt.currentTarget.classList.add('active');
+            localStorage.setItem('keiba_combined_race', raceId);
+        }}
+        
+        function openInnerTab(evt, tabId) {{
+            var parent = evt.currentTarget.closest('.race-content');
+            parent.querySelectorAll('.inner-content').forEach(el => {{ el.classList.remove('active'); el.style.display = 'none'; }});
+            parent.querySelectorAll('.inner-tab').forEach(el => el.classList.remove('active'));
+            var target = document.getElementById(tabId);
+            if (target) {{ target.style.display = 'block'; target.classList.add('active'); }}
+            evt.currentTarget.classList.add('active');
+            localStorage.setItem('keiba_combined_inner_' + parent.id, tabId);
+        }}
+        
+        // 前回開いたタブを復元
+        document.addEventListener('DOMContentLoaded', () => {{
+            const savedRace = localStorage.getItem('keiba_combined_race');
+            if (savedRace) {{
+                const btn = document.querySelector(`.race-tab[onclick*="'${{savedRace}}'"]`);
+                if (btn) btn.click();
+            }}
+            // 各レースの内部タブも復元
+            document.querySelectorAll('.race-content').forEach(rc => {{
+                const savedInner = localStorage.getItem('keiba_combined_inner_' + rc.id);
+                if (savedInner) {{
+                    const btn = rc.querySelector(`.inner-tab[onclick*="'${{savedInner}}'"]`);
+                    if (btn) btn.click();
+                }}
+            }});
+        }});
+    </script>
+</body>
+</html>'''
+    return combined_html
 # ==================================================
 # 10. ジェネレータ（全レース処理）
 # ==================================================
