@@ -345,6 +345,12 @@ def parse_nankankeiba_detail(html, place_name, resources):
                 z_full_text = z.get_text(" ", strip=True)
                 if not z_full_text:
                     continue
+                
+                # ULR取得
+                a_tag = z.select_one("a.is-link.event_stop")
+                past_url = ""
+                if a_tag and a_tag.get("href"):
+                    past_url = "https://www.nankankeiba.com" + a_tag.get("href")
 
                 # 日付と開催場
                 d_txt = ""
@@ -437,7 +443,13 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     rank_part = "着不明"
 
                 h_str = f"{d_txt} {place_short}{dist} {j_prev_full} {pas}{agari_part}→{rank_part}{pop_part}"
-                history.append(h_str)
+                history.append({
+                    "text": h_str,
+                    "url": past_url,
+                    "place": place_short,
+                    "dist": dist,
+                    "pas": pas
+                })
 
             # 表示用騎手行
             if prev_power_val:
@@ -791,6 +803,44 @@ def _parse_grades_from_ai(ai_out: str):
 
 
 # ==================================================
+# 8.5 過去レースからのテン速度取得
+# ==================================================
+def fetch_past_race_2f_times(url, driver=None):
+    """
+    過去レースURLからラップタイムを取得し、最初の2区間(約2F)の速度(km/h)を返す
+    """
+    sess = get_http_session()
+    try:
+        res = sess.get(url, timeout=5)
+        res.encoding = "cp932"
+        # ラップタイムの抽出 (例: 6.1-12.0-14.3-...)
+        m = re.search(r'([0-9]{1,2}\.[0-9]-[0-9]{1,2}\.[0-9](?:-[0-9]{1,2}\.[0-9])*)', res.text)
+        if not m:
+            return None
+            
+        parts = m.group(1).split('-')
+        if len(parts) < 2:
+            return None
+            
+        p0 = float(parts[0])
+        p1 = float(parts[1])
+        
+        # 距離の推定: 時間が8秒未満なら100m、それ以上なら200m
+        dist_0 = 100 if p0 < 8.0 else 200
+        dist_1 = 100 if p1 < 8.0 else 200
+        total_dist = dist_0 + dist_1
+        total_time = p0 + p1
+        
+        if total_time <= 0:
+            return None
+            
+        # km/h に変換
+        speed_kmh = (total_dist / total_time) * 3.6
+        return speed_kmh
+    except Exception:
+        return None
+
+# ==================================================
 # 9. 対戦表（AI評価付き） ※ここが今回の肝：out/return をループ外へ
 # ==================================================
 def _fetch_matchup_table_selenium(driver, nankan_id, grades):
@@ -928,14 +978,15 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
         base_aggro_score = 0
         if hist:
             latest_hist = hist[0]
-            pos_match = re.search(r'(\d+-\d+(?:-\d+)*)', latest_hist)
+            latest_text = latest_hist.get("text", "") if isinstance(latest_hist, dict) else latest_hist
+            pos_match = re.search(r'(\d+-\d+(?:-\d+)*)', latest_text)
             if pos_match:
                 positions = [int(p) for p in pos_match.group(1).split('-') if p.isdigit()]
                 if positions:
                     calc_pos = positions[0] 
                     base_aggro_score = max(0, 11 - calc_pos) * 2 
             
-            dist_match = re.search(r'(\d{3,4})m?', latest_hist)
+            dist_match = re.search(r'(\d{3,4})m?', latest_text)
             if dist_match:
                 prev_dist = int(dist_match.group(1))
                 if prev_dist < curr_dist:
@@ -959,11 +1010,74 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
             "umaban": umaban,
             "name": name,
             "score": final_score,
-            "danwa_reason": comment_mod
+            "danwa_reason": comment_mod,
+            "hist": hist
         })
 
+    # 一時ソートして上位5頭を抽出
     predictions.sort(key=lambda x: x["score"], reverse=True)
+    top_5 = predictions[:5]
     
+    # 南関4競馬場のテン速度を計算
+    nankan_places = ["浦和", "船橋", "大井", "川崎"]
+    speeds_log = []
+    
+    for p in top_5:
+        p["speed_avg"] = None
+        speeds = []
+        for h in p["hist"][:3]:
+            if not isinstance(h, dict) or not h.get("url"):
+                continue
+            if h.get("place") not in nankan_places:
+                continue
+                
+            raw_speed = fetch_past_race_2f_times(h["url"])
+            if raw_speed:
+                # 通過順位によるペナルティ(1番手以外は減速)
+                pas_str = h.get("pas", "")
+                penalty = 0
+                if pas_str:
+                    first_pos = pas_str.split('-')[0]
+                    if first_pos.isdigit():
+                        pos = int(first_pos)
+                        if pos > 1:
+                            # 2番手なら-0.5km/h、3番手なら-1.0km/h、10番手なら-4.5km/h 程度
+                            penalty = (pos - 1) * 0.5
+                
+                adj_speed = raw_speed - penalty
+                
+                # 距離とコースによる補正値を加算
+                place_mod = 0.0
+                dist_mod = 0.0
+                
+                past_place = h.get("place", "")
+                past_dist_str = str(h.get("dist", ""))
+                
+                if past_place in ["川崎", "浦和"]:
+                    place_mod = 0.5
+                    
+                if past_dist_str.isdigit():
+                    pd = int(past_dist_str)
+                    if pd <= 1200:
+                        dist_mod = -1.0
+                    elif pd >= 1500:
+                        dist_mod = 1.0
+                        
+                adj_speed = adj_speed + place_mod + dist_mod
+                speeds.append(adj_speed)
+                
+        if speeds:
+            p["speed_avg"] = sum(speeds) / len(speeds)
+            speeds_log.append(f"[{p['umaban']}]{p['name']}: {p['speed_avg']:.1f}km/h")
+        else:
+            speeds_log.append(f"[{p['umaban']}]{p['name']}: データなし")
+
+    # テン速度が取れた馬の中で最終的に逃げ馬の優先度を決定 (上位ほど逃げる)
+    def sort_key(x):
+        return (x["speed_avg"] if x["speed_avg"] is not None else 0, x["score"])
+
+    predictions[:5] = sorted(top_5, key=sort_key, reverse=True)
+
     escape_horses = [p for p in predictions if p["score"] >= 15]
     
     if len(escape_horses) >= 3:
@@ -982,6 +1096,8 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
     tenkai_text += f"◆ペース予想：{pace}\n"
     tenkai_text += f"◆ハナ・先行候補：{leaders}\n"
     tenkai_text += f"◆展開解説：{explanation}\n"
+    if speeds_log:
+        tenkai_text += f"◆先手候補テン速度 (近走平均)：{' / '.join(speeds_log)}\n"
     tenkai_text += "◆想定隊列順: " + " → ".join([f"[{p['umaban']}]{p['name']}" for p in predictions])
     
     return tenkai_text
@@ -1359,7 +1475,8 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                         "【近走】",
                     ]
                     for hs in h.get("hist", []):
-                        block.append(hs)
+                        hs_text = hs.get("text", "") if isinstance(hs, dict) else hs
+                        block.append(hs_text)
 
                     horse_texts.append("\n".join(block))
 
@@ -1387,8 +1504,21 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                     time.sleep(1)
                     continue
 
+                header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
+                pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
+                details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
+
                 # Difyモード
-                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中..."}
+                yield {"type": "status", "data": f"🤖 {r_num}R AI予測中... (展開のみを先行表示しています)"}
+                
+                early_text = (
+                    f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
+                    f"{header1}\n\n"
+                    f"{pace_text}\n\n"
+                    f"【現在AIの評価を生成中...約1〜3分かかります】"
+                )
+                yield {"type": "early_result", "race_num": r_num, "data_text": early_text}
+                
                 ai_out = run_dify_prediction(full_prompt)
 
                 grades = _parse_grades_from_ai(ai_out)
@@ -1411,10 +1541,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
 
 
                 # ユーザー指定のフォーマットに組み立て
-                header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
-                pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
                 eval_list_text = build_evaluation_list(grades, nk_data["horses"])
-                details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
 
                 final_text = (
                     f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"

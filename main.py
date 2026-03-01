@@ -162,6 +162,20 @@ def main():
                 elif e_type == "error":
                     st.error(e_data)
                     
+                elif e_type == "early_result":
+                    race_num = event.get("race_num")
+                    early_text = event.get("data_text", "")
+                    
+                    with result_container:
+                        st.subheader(f"{selected_place} {race_num}R")
+                        st.text_area(
+                            label=f"{race_num}R 結果 (速報:展開のみ AI待機中...)",
+                            value=early_text,
+                            height=300,
+                            key=f"res_early_{race_num}_{time.time()}"
+                        )
+                        st.divider()
+
                 elif e_type == "result":
                     race_num = event.get("race_num")
                     output_text = event.get("data_text", event.get("data", ""))
