@@ -1148,17 +1148,24 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
                 
         if speeds:
             p["speed_avg"] = sum(speeds) / len(speeds)
-            speeds_log.append(f"[{p['umaban']}]{p['name']}: {p['speed_avg']:.1f}km/h")
+            speeds_log.append(f"{_circled_num(p['umaban'])}{p['name']}: {p['speed_avg']:.1f}km/h")
         else:
-            speeds_log.append(f"[{p['umaban']}]{p['name']}: テン速度データなし(位置取りのみ)")
+            speeds_log.append(f"{_circled_num(p['umaban'])}{p['name']}: テン速度データなし(位置取りのみ)")
 
     # ============================================================
-    # ③ 最終ソート: 推定ポジション昇順 → 同帯はテン速度降順
+    # ③ 最終ソート: 位置帯(逃げ/先行/中団/後方) → 帯内はテン速度降順
     # ============================================================
+    def _pos_band(est_pos):
+        if est_pos <= 2.0: return 1   # 逃げ
+        if est_pos <= 3.5: return 2   # 先行
+        if est_pos <= 6.0: return 3   # 中団
+        return 4                       # 後方
+
     def final_sort_key(x):
-        pos = x["est_pos"]
+        band = _pos_band(x["est_pos"])
         speed = x.get("speed_avg") or 0
-        return (pos, -speed)
+        # 同じ帯内ではテン速度が速い馬が前、速度データなしはest_posで比較
+        return (band, -speed, x["est_pos"])
 
     predictions.sort(key=final_sort_key)
 
