@@ -1508,6 +1508,26 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
                 details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
 
+                # PACEモード (展開のみ)
+                if mode == "pace":
+                    yield {"type": "status", "data": f"⏱️ {r_num}R 展開予想を生成中..."}
+                    final_text = (
+                        f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
+                        f"{header1}\n\n"
+                        f"{pace_text}\n\n"
+                        f"{details_text}"
+                    )
+                    final_html = generate_html_output(
+                        year, month, day, place_name, r_num, header1, pace_text, 
+                        "【評価一覧】 (展開のみモードのため省略)", 
+                        "【対戦表】 (展開のみモードのため省略)", 
+                        "AI評価なし", 
+                        details_text
+                    )
+                    yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
+                    time.sleep(1)
+                    continue
+
                 # Difyモード
                 yield {"type": "status", "data": f"🤖 {r_num}R AI予測中... (展開のみを先行表示しています)"}
                 

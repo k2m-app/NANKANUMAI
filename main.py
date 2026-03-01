@@ -44,8 +44,8 @@ def main():
         st.subheader("モード選択")
         exec_mode = st.radio(
             "実行モード",
-            ("dify", "raw"),
-            format_func=lambda x: "🤖 AIで予想する(Dify)" if x == "dify" else "📋 データのみ取得(コピペ用)"
+            ("dify", "pace", "raw"),
+            format_func=lambda x: {"dify": "🤖 AIで予想する(Dify)", "pace": "⏱️ 展開のみ(AIなし・高速)", "raw": "📋 データのみ取得(コピペ用)"}[x]
         )
         
         st.divider()
@@ -143,7 +143,9 @@ def main():
         day = f"{target_date.day:02}"
         
         status_area = st.empty()
-        mode_text = "AI予想" if exec_mode == "dify" else "データ取得"
+        
+        mode_text_map = {"dify": "AI予想", "pace": "展開予想のみ", "raw": "データ取得"}
+        mode_text = mode_text_map.get(exec_mode, "実行")
         status_area.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 ({len(selected_races_final)}レース) の【{mode_text}】を開始します...")
 
         # 手動入力のパラメータ
