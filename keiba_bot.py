@@ -338,7 +338,7 @@ def parse_nankankeiba_detail(html, place_name, resources):
             prev_power_val = None
             prev_jockey_latest = ""
 
-            for i in range(1, 4):
+            for i in range(1, 6):
                 z = row.select_one(f"td.cs-z{i}")
                 if not z:
                     continue
@@ -443,12 +443,22 @@ def parse_nankankeiba_detail(html, place_name, resources):
                     rank_part = "着不明"
 
                 h_str = f"{d_txt} {place_short}{dist} {j_prev_full} {pas}{agari_part}→{rank_part}{pop_part}"
+                # rank/popを数値化
+                rank_int = int(rank) if str(rank).isdigit() else None
+                pop_int = None
+                if pop:
+                    pm2 = re.search(r'(\d+)', pop)
+                    if pm2:
+                        pop_int = int(pm2.group(1))
+
                 history.append({
                     "text": h_str,
                     "url": past_url,
                     "place": place_short,
                     "dist": dist,
-                    "pas": pas
+                    "pas": pas,
+                    "rank": rank_int,
+                    "pop": pop_int
                 })
 
             # 表示用騎手行
@@ -965,6 +975,16 @@ def _fetch_matchup_table_selenium(driver, nankan_id, grades):
         return f"(対戦表取得エラー: {e})"
 
 
+def _circled_num(n):
+    """馬番を丸数字に変換 (①〜⑳)"""
+    try:
+        n = int(n)
+    except (ValueError, TypeError):
+        return str(n)
+    if 1 <= n <= 20:
+        return chr(0x2460 + n - 1)  # ① = U+2460
+    return str(n)
+
 def predict_pace_python(horses_data, danwa_data, current_distance_str):
     predictions = []
     
@@ -972,63 +992,125 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
     dm = re.search(r'(\d{1,3}(?:,\d{3})*|\d+)(?=m)', str(current_distance_str).replace(',', ''))
     curr_dist = int(dm.group(1)) if dm else 1400
 
+    nankan_places = ["浦和", "船橋", "大井", "川崎"]
+    jra_keywords = ["JRA", "東京", "中山", "阪神", "京都", "中京", "小倉", "新潟", "福島", "函館", "札幌"]
+
     for umaban, data in horses_data.items():
         name = data.get("name", "")
         hist = data.get("hist", [])
         danwa = danwa_data.get(umaban, "")
         
-        base_aggro_score = 0
-        if hist:
-            latest_hist = hist[0]
-            latest_text = latest_hist.get("text", "") if isinstance(latest_hist, dict) else latest_hist
-            pos_match = re.search(r'(\d+-\d+(?:-\d+)*)', latest_text)
-            if pos_match:
-                positions = [int(p) for p in pos_match.group(1).split('-') if p.isdigit()]
-                if positions:
-                    calc_pos = positions[0] 
-                    base_aggro_score = max(0, 11 - calc_pos) * 2 
+        # ============================================================
+        # ① 位置取り推定 (PRIMARY): 全馬に対し通過順ベースで算出
+        # ============================================================
+        weighted_positions = []
+        ideal_position = None  # 好走時の位置取り
+        
+        for idx, h in enumerate(hist[:5]):
+            if not isinstance(h, dict):
+                continue
+            pas_str = h.get("pas", "")
+            if not pas_str:
+                continue
+            first_pos_str = pas_str.split("-")[0]
+            if not first_pos_str.isdigit():
+                continue
+            first_pos = int(first_pos_str)
             
-            dist_match = re.search(r'(\d{3,4})m?', latest_text)
-            if dist_match:
-                prev_dist = int(dist_match.group(1))
-                if prev_dist < curr_dist:
-                    base_aggro_score += 5  
-                elif prev_dist > curr_dist:
-                    base_aggro_score -= 3  
-
-        comment_mod = 0
+            # 重み: 前走×3, 2走前×2, 3走前以降×1
+            if idx == 0:
+                weight = 3
+            elif idx == 1:
+                weight = 2
+            else:
+                weight = 1
+            
+            # 開催場レベル補正
+            place = h.get("place", "")
+            place_adj = 0
+            is_jra = any(kw in place for kw in jra_keywords)
+            is_nankan = place in nankan_places
+            if is_jra:
+                place_adj = -1  # JRA→南関では前に行きやすい
+            elif not is_nankan and place:
+                place_adj = 2   # 南関以外の地方→南関では前に行きにくい
+            
+            adjusted_pos = max(1, first_pos + place_adj)
+            
+            # 距離差補正 (前走距離 → 今回距離)
+            past_dist_str = str(h.get("dist", ""))
+            if past_dist_str.isdigit():
+                pd = int(past_dist_str)
+                if pd > curr_dist:
+                    adjusted_pos = max(1, adjusted_pos - 1)  # 距離短縮→前に行きやすい
+                elif pd < curr_dist:
+                    adjusted_pos += 1  # 距離延長→前に行きにくい
+            
+            for _ in range(weight):
+                weighted_positions.append(adjusted_pos)
+            
+            # 好走時の位置取り優先ロジック
+            rank = h.get("rank")
+            pop = h.get("pop")
+            if rank is not None:
+                is_great_run = False
+                if pop is not None and (pop - rank) >= 4:
+                    is_great_run = True
+                if rank <= 2:
+                    is_great_run = True
+                if is_great_run and ideal_position is None:
+                    ideal_position = adjusted_pos
+        
+        # 推定ポジション算出
+        if weighted_positions:
+            avg_pos = sum(weighted_positions) / len(weighted_positions)
+            if ideal_position is not None and ideal_position < avg_pos:
+                est_pos = ideal_position * 0.4 + avg_pos * 0.6
+            else:
+                est_pos = avg_pos
+        else:
+            est_pos = 6.0  # データなし→中団想定
+        
+        # コメント補正
+        comment_mod = 0.0
         if danwa:
             if re.search(r'(前走|前回).*(逃げ|前).*(苦し|厳し|バテ|甘く)', danwa):
-                comment_mod -= 5
+                comment_mod += 1.0
             if re.search(r'(ハナ.*こだわらない|控える|溜める|番手.(いい|競馬)|中団)', danwa):
-                comment_mod -= 10
+                comment_mod += 2.0
             if re.search(r'(ハナ.(切|行|主張|立)|前.(行け|つけ|行きた))', danwa):
-                comment_mod += 15
+                comment_mod -= 2.0
 
-        waku_mod = max(0, 5 - int(umaban) if str(umaban).isdigit() else 0)
-        final_score = base_aggro_score + comment_mod + waku_mod
+        est_pos += comment_mod
+        est_pos = max(1.0, est_pos)
+        
+        # 枠番補正
+        if str(umaban).isdigit():
+            waku_mod = max(0, (6 - int(umaban)) * 0.15)
+            est_pos -= waku_mod
+            est_pos = max(1.0, est_pos)
         
         predictions.append({
             "umaban": umaban,
             "name": name,
-            "score": final_score,
-            "danwa_reason": comment_mod,
+            "est_pos": round(est_pos, 2),
+            "ideal_pos": ideal_position,
             "hist": hist
         })
 
-    # 一時ソートして上位5頭を抽出
-    predictions.sort(key=lambda x: x["score"], reverse=True)
+    # ============================================================
+    # ② テン速度計算 (TIEBREAKER): 先行候補上位5頭のみに実行
+    # ============================================================
+    predictions.sort(key=lambda x: x["est_pos"])
     top_5 = predictions[:5]
     
-    # 南関4競馬場のテン速度を計算
-    nankan_places = ["浦和", "船橋", "大井", "川崎"]
     speeds_log = []
     url_cache = {}
     
     for p in top_5:
         p["speed_avg"] = None
         speeds = []
-        for h in p["hist"][:3]:
+        for h in p["hist"][:5]:
             if not isinstance(h, dict) or not h.get("url"):
                 continue
             if h.get("place") not in nankan_places:
@@ -1042,72 +1124,108 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
                 url_cache[past_url] = raw_speed
                 
             if raw_speed:
-                # 通過順位によるペナルティ(1番手以外は減速)
                 pas_str = h.get("pas", "")
                 penalty = 0
                 if pas_str:
-                    first_pos = pas_str.split('-')[0]
-                    if first_pos.isdigit():
-                        pos = int(first_pos)
-                        if pos > 1:
-                            # 2番手なら-0.5km/h、3番手なら-1.0km/h、10番手なら-4.5km/h 程度
-                            penalty = (pos - 1) * 0.5
+                    fp = pas_str.split('-')[0]
+                    if fp.isdigit() and int(fp) > 1:
+                        penalty = (int(fp) - 1) * 0.5
                 
                 adj_speed = raw_speed - penalty
                 
-                # 距離とコースによる補正値を加算
-                place_mod = 0.0
-                dist_mod = 0.0
-                
                 past_place = h.get("place", "")
                 past_dist_str = str(h.get("dist", ""))
-                
                 if past_place in ["川崎", "浦和"]:
-                    place_mod = 0.5
-                    
+                    adj_speed += 0.5
                 if past_dist_str.isdigit():
                     pd = int(past_dist_str)
                     if pd <= 1200:
-                        dist_mod = -1.0
+                        adj_speed -= 1.0
                     elif pd >= 1500:
-                        dist_mod = 1.0
+                        adj_speed += 1.0
                         
-                adj_speed = adj_speed + place_mod + dist_mod
                 speeds.append(adj_speed)
                 
         if speeds:
             p["speed_avg"] = sum(speeds) / len(speeds)
             speeds_log.append(f"[{p['umaban']}]{p['name']}: {p['speed_avg']:.1f}km/h")
         else:
-            speeds_log.append(f"[{p['umaban']}]{p['name']}: データなし")
+            speeds_log.append(f"[{p['umaban']}]{p['name']}: テン速度データなし(位置取りのみ)")
 
-    # テン速度が取れた馬の中で最終的に逃げ馬の優先度を決定 (上位ほど逃げる)
-    def sort_key(x):
-        return (x["speed_avg"] if x["speed_avg"] is not None else 0, x["score"])
+    # ============================================================
+    # ③ 最終ソート: 推定ポジション昇順 → 同帯はテン速度降順
+    # ============================================================
+    def final_sort_key(x):
+        pos = x["est_pos"]
+        speed = x.get("speed_avg") or 0
+        return (pos, -speed)
 
-    predictions[:5] = sorted(top_5, key=sort_key, reverse=True)
+    predictions.sort(key=final_sort_key)
 
-    escape_horses = [p for p in predictions if p["score"] >= 15]
+    # ペース判定
+    escape_count = sum(1 for p in predictions if p["est_pos"] <= 2.0)
+    senkou_count = sum(1 for p in predictions if p["est_pos"] <= 3.5)
     
-    if len(escape_horses) >= 3:
+    if escape_count >= 3:
         pace = "ハイペース"
         explanation = "逃げ・先行意欲の高い馬が複数おり、序盤から激しいポジション争いが予想されるため、差し馬の台頭に注意。"
-    elif len(escape_horses) == 0:
+    elif escape_count == 0 and senkou_count <= 1:
         pace = "スローペース"
         explanation = "明確にハナを主張する馬がおらず、押し出されるように隊列が落ち着く可能性が高い。前残りの展開に注意。"
+    elif escape_count >= 2:
+        pace = "やや速いペース"
+        explanation = "逃げたい馬が複数おり、先行争いが予想される。中団からの好位差しが有効になる可能性。"
     else:
         pace = "ミドルペース"
         explanation = "ハナ候補がすんなり隊列を先導し、淀みのない平均的なペースで流れると予想される。"
 
-    leaders = " ".join([f"[{h['umaban']}]{h['name']}" for h in predictions[:2]])
+    leaders = " ".join([f"{_circled_num(h['umaban'])}{h['name']}" for h in predictions[:2]])
+    
+    # 位置取り分類テキスト
+    pos_groups = {"逃げ": [], "先行": [], "中団": [], "後方": []}
+    for p in predictions:
+        ep = p["est_pos"]
+        ideal_mark = ""
+        if p.get("ideal_pos") is not None and p["ideal_pos"] <= 2:
+            ideal_mark = "★"
+        cn = _circled_num(p['umaban'])
+        if ep <= 1.5:
+            pos_groups["逃げ"].append(f"{cn}{p['name']}{ideal_mark}")
+        elif ep <= 3.5:
+            pos_groups["先行"].append(f"{cn}{p['name']}{ideal_mark}")
+        elif ep <= 6.0:
+            pos_groups["中団"].append(f"{cn}{p['name']}")
+        else:
+            pos_groups["後方"].append(f"{cn}{p['name']}")
     
     tenkai_text = f"【展開予想】\n"
     tenkai_text += f"◆ペース予想：{pace}\n"
     tenkai_text += f"◆ハナ・先行候補：{leaders}\n"
     tenkai_text += f"◆展開解説：{explanation}\n"
+    
+    for label in ["逃げ", "先行", "中団", "後方"]:
+        members = pos_groups[label]
+        if members:
+            tenkai_text += f"◆{label}候補：{' / '.join(members)}\n"
+    
     if speeds_log:
-        tenkai_text += f"◆先手候補テン速度 (近走平均)：{' / '.join(speeds_log)}\n"
-    tenkai_text += "◆想定隊列順: " + " → ".join([f"[{p['umaban']}]{p['name']}" for p in predictions])
+        tenkai_text += f"◆先手候補テン速度：{' / '.join(speeds_log)}\n"
+    
+    # 想定隊列順: 近い位置の馬をカンマ区切り、離れたらスペース区切り
+    formation_parts = []
+    prev_pos = None
+    current_group = []
+    for p in predictions:
+        cn = _circled_num(p['umaban'])
+        if prev_pos is not None and (p['est_pos'] - prev_pos) > 1.0:
+            formation_parts.append(','.join(current_group))
+            current_group = [cn]
+        else:
+            current_group.append(cn)
+        prev_pos = p['est_pos']
+    if current_group:
+        formation_parts.append(','.join(current_group))
+    tenkai_text += "◆想定隊列順: " + " ".join(formation_parts)
     
     return tenkai_text
 
@@ -1506,7 +1624,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                     
                     header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
                     pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
-                    details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
+                    details_text = ""
 
                     final_text = (
                         f"📅 {year}/{month}/{day} {place_name}{r_num}R\n\n"
@@ -1523,7 +1641,7 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
 
                 header1 = f"{nk_data['meta'].get('race_name','')}  {nk_data['meta'].get('course','')}  {nk_data['meta'].get('grade','')}"
                 pace_text = predict_pace_python(nk_data["horses"], danwa, nk_data['meta'].get('course',''))
-                details_text = "【馬別詳細結果】\n" + "\n\n".join(horse_texts)
+                details_text = ""
 
                 # PACEモード (展開のみ)
                 if mode == "pace":
