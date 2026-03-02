@@ -1104,7 +1104,7 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
     predictions.sort(key=lambda x: x["est_pos"])
     top_5 = predictions[:5]
     
-    speeds_log = []
+    speed_data_list = []
     url_cache = {}
     
     for p in top_5:
@@ -1148,10 +1148,41 @@ def predict_pace_python(horses_data, danwa_data, current_distance_str):
                 
         if speeds:
             p["speed_avg"] = sum(speeds) / len(speeds)
-            speeds_log.append(f"{_circled_num(p['umaban'])}{p['name']}: {p['speed_avg']:.1f}km/h")
+            speed_data_list.append({
+                "umaban": p["umaban"],
+                "name": p["name"],
+                "speed": p["speed_avg"],
+                "est_pos": p["est_pos"]
+            })
         else:
-            speeds_log.append(f"{_circled_num(p['umaban'])}{p['name']}: テン速度データなし(位置取りのみ)")
-
+            speed_data_list.append({
+                "umaban": p["umaban"],
+                "name": p["name"],
+                "speed": -1.0,  # 速度なし
+                "est_pos": p["est_pos"]
+            })
+            
+    # テン速度の降順にソート (速度データなしは後ろ)
+    speed_data_list.sort(key=lambda x: x["speed"], reverse=True)
+    
+    speeds_log = []
+    for i, sd in enumerate(speed_data_list):
+        if sd["speed"] >= 0:
+            text = f"{_circled_num(sd['umaban'])}{sd['name']}: {sd['speed']:.1f}km/h"
+        else:
+            text = f"{_circled_num(sd['umaban'])}{sd['name']}: テン速度なし(位置)"
+            
+        # HTML出力用に装飾マーカーを付与
+        # 先行3頭以内で速度データがある場合
+        if i < 3 and sd["speed"] >= 0:
+            if sd["est_pos"] <= 3.5:
+                # ハナ・先行候補
+                text = f"[[RB]]{text}[[/RB]]"
+            else:
+                # 中団・後方候補
+                text = f"[[B]]{text}[[/B]]"
+                
+        speeds_log.append(text)
     # ============================================================
     # ③ 最終ソート: 位置帯(逃げ/先行/中団/後方) → 帯内はテン速度降順
     # ============================================================
@@ -1494,7 +1525,7 @@ def generate_html_output(year, month, day, place_name, r_num, header1, pace_text
 
     <div id="tab-pace" class="tab-content active">
         <div class="content-box">
-            <pre>{html.escape(pace_text)}</pre>
+            <pre>{html.escape(pace_text).replace('[[RB]]', '<span style="color:#e74c3c;font-weight:bold;">').replace('[[/RB]]', '</span>').replace('[[B]]', '<span style="font-weight:bold;">').replace('[[/B]]', '</span>')}</pre>
         </div>
     </div>
 
@@ -1686,12 +1717,13 @@ def generate_combined_html(year, month, day, place_name, race_results):
             <div id="race-{r_num}-pace" class="inner-content active">
                 <div class="content-box">
                     <div class="eval-box">{_rank_color(eval_part)}</div>
-                    <pre>{_escape(pace_part)}</pre>
+                    <pre>{_escape(pace_part).replace('[[RB]]', '<span style="color:#e74c3c;font-weight:bold;">').replace('[[/RB]]', '</span>').replace('[[B]]', '<span style="font-weight:bold;">').replace('[[/B]]', '</span>')}</pre>
                 </div>
             </div>
             
             <div id="race-{r_num}-ai" class="inner-content">
                 <div class="content-box">
+                    <div class="eval-box" style="margin-bottom:10px; padding-bottom:10px; border-bottom:1px dashed #ccc;">{_rank_color(eval_part)}</div>
                     <div style="white-space:pre-wrap;font-size:0.95em;line-height:1.5;">{_format_ai(ai_part)}</div>
                 </div>
             </div>
@@ -1866,9 +1898,30 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                     r_nums.append(int(f[14:16]))
         r_nums = sorted(set(r_nums)) or list(range(1, 13))
 
+        os.makedirs("cache", exist_ok=True)
         for r_num in r_nums:
             if target_races and r_num not in target_races:
                 continue
+
+            # === Caching Engine ===
+            cache_file = f"cache/{year}{month}{day}_{place_code}_{r_num}_{mode}.json"
+            if os.path.exists(cache_file):
+                if time.time() - os.path.getmtime(cache_file) < 3600:
+                    try:
+                        with open(cache_file, "r", encoding="utf-8") as f:
+                            cached_data = json.load(f)
+                        yield {"type": "status", "data": f"⚡ {r_num}R キャッシュから高速読み込み中... (前回実行から1時間以内)"}
+                        
+                        yield {
+                            "type": "result",
+                            "race_num": r_num,
+                            "data_text": cached_data.get("data_text", ""),
+                            "data_html": cached_data.get("data_html", "")
+                        }
+                        time.sleep(0.5)
+                        continue
+                    except Exception:
+                        pass # if cache is corrupted, proceed as normal
 
             yield {"type": "status", "data": f"🏇 {r_num}R データ解析中..."}
 
@@ -1966,6 +2019,15 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                     )
                     final_html = generate_html_output(year, month, day, place_name, r_num, header1, pace_text, "【評価一覧】  (AI未実行)", match_txt, "(AI未実行)", details_text)
 
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "data_text": final_text,
+                                "data_html": final_html
+                            }, f, ensure_ascii=False)
+                    except Exception:
+                        pass
+
                     yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
                     time.sleep(1)
                     continue
@@ -1990,6 +2052,16 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                         "AI評価なし", 
                         details_text
                     )
+
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "data_text": final_text,
+                                "data_html": final_html
+                            }, f, ensure_ascii=False)
+                    except Exception:
+                        pass
+
                     yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
                     time.sleep(1)
                     continue
@@ -2022,6 +2094,9 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 # 余計な罫線/空行を軽く整形
                 ai_out_clean = re.sub(r"^\s*-{3,}\s*$", "", ai_text, flags=re.MULTILINE)
                 ai_out_clean = re.sub(r"\n{3,}", "\n\n", ai_out_clean).strip()
+                
+                # AIがヘッダーを復唱した場合は削除する
+                ai_out_clean = re.sub(r"^レース名:.*?(?:\n|$)", "", ai_out_clean, flags=re.MULTILINE).strip()
 
                 ai_out_clean = inject_cyokyo_before_rank(ai_out_clean, cyokyo)
 
@@ -2040,6 +2115,15 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 )
                 
                 final_html = generate_html_output(year, month, day, place_name, r_num, header1, pace_text, eval_list_text, match_txt, ai_out_clean, details_text)
+
+                try:
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "data_text": final_text,
+                            "data_html": final_html
+                        }, f, ensure_ascii=False)
+                except Exception:
+                    pass
 
                 yield {"type": "result", "race_num": r_num, "data_text": final_text, "data_html": final_html}
                 time.sleep(15)

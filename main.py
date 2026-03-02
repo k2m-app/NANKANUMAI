@@ -105,7 +105,8 @@ def main():
             full_text.append(f"【{target_date.strftime('%Y/%m/%d')} {selected_place} データまとめ】\n")
             for r_num, content_dict in sorted(st.session_state.results_cache.items()):
                 text_val = content_dict.get("text", "") if isinstance(content_dict, dict) else content_dict
-                full_text.append(f"\n{'='*35}\n {selected_place} {r_num}R\n{'='*35}\n{text_val}\n")
+                disp_val = text_val.replace('[[RB]]', '').replace('[[/RB]]', '').replace('[[B]]', '').replace('[[/B]]', '')
+                full_text.append(f"\n{'='*35}\n {selected_place} {r_num}R\n{'='*35}\n{disp_val}\n")
             
             with st.expander("📚 全レース結果をまとめてコピーする", expanded=True):
                 st.text_area("全レース結果", value="\n".join(full_text), height=300, key="res_all_summary")
@@ -129,11 +130,12 @@ def main():
             for r_num, content_dict in sorted(st.session_state.results_cache.items()):
                 st.subheader(f"{selected_place} {r_num}R")
                 text_val = content_dict.get("text", "") if isinstance(content_dict, dict) else content_dict
+                disp_val = text_val.replace('[[RB]]', '').replace('[[/RB]]', '').replace('[[B]]', '').replace('[[/B]]', '')
                 html_val = content_dict.get("html", "") if isinstance(content_dict, dict) else ""
                 
                 st.text_area(
                     label=f"{r_num}R 結果",
-                    value=text_val,
+                    value=disp_val,
                     height=500,
                     key=f"res_cache_{r_num}"
                 )
@@ -208,7 +210,7 @@ def main():
                         st.subheader(f"{selected_place} {race_num}R")
                         st.text_area(
                             label=f"{race_num}R 結果 (速報:展開のみ AI待機中...)",
-                            value=early_text,
+                            value=early_text.replace('[[RB]]', '').replace('[[/RB]]', '').replace('[[B]]', '').replace('[[/B]]', ''),
                             height=300,
                             key=f"res_early_{race_num}_{time.time()}"
                         )
@@ -228,7 +230,7 @@ def main():
                         st.subheader(f"{selected_place} {race_num}R")
                         st.text_area(
                             label=f"{race_num}R 結果 (速報)",
-                            value=output_text,
+                            value=output_text.replace('[[RB]]', '').replace('[[/RB]]', '').replace('[[B]]', '').replace('[[/B]]', ''),
                             height=500,
                             key=f"res_live_{race_num}"
                         )
