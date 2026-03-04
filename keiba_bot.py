@@ -169,11 +169,15 @@ def run_dify_prediction(full_text: str) -> str:
                     except Exception:
                         pass
 
-                return full_response if full_response else "（回答生成エラー）"
+                if full_response:
+                    return full_response
+                # 結果が空の場合はリトライする
+                time.sleep(5)
+                continue
         except Exception:
             time.sleep(5)
 
-    return "⚠️ エラー: リトライ上限を超えました"
+    return "（回答生成エラー）"
 
 
 # ==================================================
@@ -1910,16 +1914,22 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                     try:
                         with open(cache_file, "r", encoding="utf-8") as f:
                             cached_data = json.load(f)
-                        yield {"type": "status", "data": f"⚡ {r_num}R キャッシュから高速読み込み中... (前回実行から1時間以内)"}
                         
-                        yield {
-                            "type": "result",
-                            "race_num": r_num,
-                            "data_text": cached_data.get("data_text", ""),
-                            "data_html": cached_data.get("data_html", "")
-                        }
-                        time.sleep(0.5)
-                        continue
+                        data_text = cached_data.get("data_text", "")
+                        if "（回答生成エラー）" in data_text or "⚠️ エラー" in data_text or "⚠️ Dify Error" in data_text:
+                            # エラーが含まれているキャッシュは無視して再生成へ進む
+                            pass
+                        else:
+                            yield {"type": "status", "data": f"⚡ {r_num}R キャッシュから高速読み込み中... (前回実行から1時間以内)"}
+                            
+                            yield {
+                                "type": "result",
+                                "race_num": r_num,
+                                "data_text": data_text,
+                                "data_html": cached_data.get("data_html", "")
+                            }
+                            time.sleep(0.5)
+                            continue
                     except Exception:
                         pass # if cache is corrupted, proceed as normal
 
@@ -2117,11 +2127,12 @@ def run_races_iter(year, month, day, place_code, target_races, mode="dify", manu
                 final_html = generate_html_output(year, month, day, place_name, r_num, header1, pace_text, eval_list_text, match_txt, ai_out_clean, details_text)
 
                 try:
-                    with open(cache_file, "w", encoding="utf-8") as f:
-                        json.dump({
-                            "data_text": final_text,
-                            "data_html": final_html
-                        }, f, ensure_ascii=False)
+                    if "（回答生成エラー）" not in ai_out_clean and "⚠️ エラー" not in ai_out_clean and "⚠️ Dify Error" not in ai_out_clean:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "data_text": final_text,
+                                "data_html": final_html
+                            }, f, ensure_ascii=False)
                 except Exception:
                     pass
 
